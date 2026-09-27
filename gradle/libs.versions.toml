@@ -1,5 +1,5 @@
 [versions]
-agp = "8.12.0-alpha02"
+agp = "8.12.0"
 kotlin = "2.0.21"
 # 与 SDK 36、AGP 8.12 和 Kotlin 2.0 的构建基线保持兼容。
 coreKtx = "1.16.0"
