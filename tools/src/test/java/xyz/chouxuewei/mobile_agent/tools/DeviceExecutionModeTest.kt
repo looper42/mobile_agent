@@ -1,6 +1,9 @@
 package xyz.chouxuewei.mobile_agent.tools
 
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -35,11 +38,26 @@ class DeviceExecutionModeTest {
     @Test
     fun openingDeviceDoesNotForceAUserModeChoice() {
         val definition = DeviceToolProvider(UnusedGateway).definitions.single { it.id == "device_open" }
+        val required = TOOL_JSON.parseToJsonElement(definition.inputSchema).jsonObject
+            .getValue("required").jsonArray.map { it.jsonPrimitive.content }
         assertTrue(definition.userChoices.isEmpty())
-        assertTrue(definition.inputSchema.contains("\"required\":[\"mode\"]"))
+        assertTrue("mode" in required)
         assertFalse(definition.inputSchema.contains("\"default\":"))
         assertTrue(definition.description.contains("任务目标"))
         assertTrue(definition.description.contains("打开或切换应用"))
+    }
+
+    @Test
+    fun everyDeviceCallRequiresAUserFacingStepSummary() {
+        DeviceToolProvider(UnusedGateway).definitions.forEach { definition ->
+            val schema = TOOL_JSON.parseToJsonElement(definition.inputSchema).jsonObject
+            val summary = schema.getValue("properties").jsonObject.getValue("step_summary").jsonObject
+            val required = schema.getValue("required").jsonArray.map { it.jsonPrimitive.content }
+
+            assertEquals("string", summary.getValue("type").jsonPrimitive.content)
+            assertEquals(80, summary.getValue("maxLength").jsonPrimitive.content.toInt())
+            assertTrue("${definition.id} must require step_summary", "step_summary" in required)
+        }
     }
 
     private object UnusedGateway : DeviceGateway {

@@ -24,7 +24,7 @@ Mobile Agent is an open-source AI chat and local-tool application for Android. I
 
 ## Permissions and Data Boundaries
 
-Mobile Agent may request access to the microphone, notifications, display-over-other-apps, startup after device boot, the installed-app list, and accessibility services. Root access, accessibility services, screenshots, and external model calls are highly privileged capabilities and should only be used after the user explicitly enables or approves them.
+Mobile Agent may request access to the microphone, notifications, display-over-other-apps, startup after device boot, the installed-app list, installing updates, and accessibility services. Root access, accessibility services, screenshots, and external model calls are highly privileged capabilities and should only be used after the user explicitly enables or approves them.
 
 Model requests, speech transcription, and webpage access may send user-selected content to the corresponding third-party services. Read the [Privacy Notice](PRIVACY.md) before installing or using the app.
 

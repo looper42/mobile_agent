@@ -151,6 +151,7 @@ import xyz.chouxuewei.mobile_agent.attachments.IncomingShare
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputSource
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputState
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputTarget
+import xyz.chouxuewei.mobile_agent.update.AppUpdateState
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -180,6 +181,7 @@ fun ChatApp(app: PrototypeApplication) {
     val settings = environment.modelSettings
     val speechSettings = environment.speechSettings
     val voiceInputState = environment.voiceInputState
+    val appUpdateState by app.appUpdater.state.collectAsStateWithLifecycle()
     val toolTitles = remember(app) {
         app.toolRegistry.definitions.associate { definition -> definition.id to definition.title }
     }
@@ -202,6 +204,7 @@ fun ChatApp(app: PrototypeApplication) {
     var artifactToDelete by remember { mutableStateOf<Artifact?>(null) }
     var attachmentTarget by rememberSaveable { mutableStateOf<String?>(null) }
     var voiceMode by rememberSaveable { mutableStateOf(false) }
+    var dismissedUpdateTag by rememberSaveable { mutableStateOf<String?>(null) }
     LaunchedEffect(requestedSettingsPage) {
         requestedSettingsPage?.let { destination ->
             settingsPage = destination
@@ -325,6 +328,37 @@ fun ChatApp(app: PrototypeApplication) {
                     isAppearanceLightNavigationBars = !dark
                 }
             }
+        }
+
+        val availableUpdate = appUpdateState as? AppUpdateState.Available
+        if (
+            settingsPage == null && pendingApproval == null && pendingQuestion == null && incomingShare == null &&
+            availableUpdate != null && dismissedUpdateTag != availableUpdate.release.tagName
+        ) {
+            AlertDialog(
+                onDismissRequest = { dismissedUpdateTag = availableUpdate.release.tagName },
+                title = { Text(localizedText("发现新版本 ${availableUpdate.release.tagName}", "Version ${availableUpdate.release.tagName} is available")) },
+                text = {
+                    Text(
+                        availableUpdate.release.notes.ifBlank {
+                            localizedText("可以从 GitHub 下载并安装最新版本。", "Download and install the latest version from GitHub.")
+                        },
+                        maxLines = 8,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        dismissedUpdateTag = availableUpdate.release.tagName
+                        settingsPage = "about"
+                    }) { Text(localizedText("查看更新", "View update")) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { dismissedUpdateTag = availableUpdate.release.tagName }) {
+                        Text(localizedText("稍后", "Later"))
+                    }
+                },
+            )
         }
 
         settingsPage?.let { destination ->

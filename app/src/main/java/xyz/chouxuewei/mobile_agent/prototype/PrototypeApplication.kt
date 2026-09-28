@@ -36,6 +36,7 @@ import xyz.chouxuewei.mobile_agent.model.SpeechTranscriptionGateway
 import xyz.chouxuewei.mobile_agent.model.IflytekSpeechTranscriptionGateway
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputController
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputDestination
+import xyz.chouxuewei.mobile_agent.update.AppUpdateManager
 
 class PrototypeApplication : Application() {
     private val chatHttpClient by lazy { streamingChatHttpClient() }
@@ -92,6 +93,7 @@ class PrototypeApplication : Application() {
     val modelSettings by lazy { ModelSettingsRepository(this, debugModelConfig) }
     val modelUsage by lazy { ModelUsageRepository(this) }
     val requestedSettingsPage = MutableStateFlow<String?>(null)
+    val appUpdater by lazy { AppUpdateManager(this, applicationScope, BuildConfig.VERSION_NAME) }
     val voiceInput by lazy {
         VoiceInputController(
             context = this,
@@ -146,5 +148,7 @@ class PrototypeApplication : Application() {
             artifacts.cleanup()
             attachments.cleanup()
         }
+        // 调试/仪器测试构建不在启动时访问公网；“关于”页仍可手动检查。
+        if (!BuildConfig.DEBUG) appUpdater.checkForUpdates()
     }
 }

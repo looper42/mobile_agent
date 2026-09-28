@@ -43,6 +43,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -82,6 +83,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.os.LocaleListCompat
+import java.io.File
 import kotlinx.coroutines.launch
 import xyz.chouxuewei.mobile_agent.BuildConfig
 import xyz.chouxuewei.mobile_agent.R
@@ -104,6 +106,8 @@ import xyz.chouxuewei.mobile_agent.data.SpeechSettings
 import xyz.chouxuewei.mobile_agent.device.RootAccessState
 import xyz.chouxuewei.mobile_agent.prototype.PrototypeApplication
 import xyz.chouxuewei.mobile_agent.ui.theme.LocalChatColors
+import xyz.chouxuewei.mobile_agent.update.AppUpdateState
+import xyz.chouxuewei.mobile_agent.update.ReleaseInfo
 
 private data class SettingsTab(val id: String, val label: String, val icon: Int)
 private data class SettingsNotice(val message: String, val success: Boolean)
@@ -544,7 +548,7 @@ fun ChatSettings(
                 )
 
                 "about" -> AboutSettings(
-                    versionName = BuildConfig.VERSION_NAME,
+                    app = app,
                     context = context,
                     onError = {
                         feedback = it
@@ -2024,10 +2028,41 @@ private fun DataSettings(
 
 @Composable
 private fun AboutSettings(
-    versionName: String,
+    app: PrototypeApplication,
     context: Context,
     onError: (SettingsNotice) -> Unit
 ) {
+    val updateState by app.appUpdater.state.collectAsStateWithLifecycle()
+    var pendingInstall by remember { mutableStateOf<File?>(null) }
+    val installPermission = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        val apk = pendingInstall
+        pendingInstall = null
+        if (apk != null) {
+            if (app.appUpdater.canInstallPackages()) {
+                runCatching { app.appUpdater.launchInstaller(apk) }
+                    .onFailure { onError(SettingsNotice(userFacingMessage(it, localizedText("无法打开系统安装界面", "Could not open the system installer")), false)) }
+            } else {
+                onError(SettingsNotice(localizedText("需要允许本应用安装未知来源应用", "Allow this app to install unknown apps first"), false))
+            }
+        }
+    }
+    val installUpdate: (File) -> Unit = { apk ->
+        if (app.appUpdater.canInstallPackages()) {
+            runCatching { app.appUpdater.launchInstaller(apk) }
+                .onFailure { onError(SettingsNotice(userFacingMessage(it, localizedText("无法打开系统安装界面", "Could not open the system installer")), false)) }
+        } else {
+            pendingInstall = apk
+            runCatching { installPermission.launch(app.appUpdater.installPermissionIntent()) }
+                .onFailure {
+                    pendingInstall = null
+                    onError(SettingsNotice(userFacingMessage(it, localizedText("无法打开安装权限设置", "Could not open the install permission settings")), false))
+                }
+        }
+    }
+    LaunchedEffect(Unit) {
+        if (updateState is AppUpdateState.Idle) app.appUpdater.checkForUpdates()
+    }
+
     Column(
         Modifier
             .fillMaxWidth()
@@ -2035,9 +2070,19 @@ private fun AboutSettings(
             .padding(horizontal = 20.dp, vertical = 18.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Text(localizedText("应用", "Apply"), style = MaterialTheme.typography.titleSmall)
+        Text(localizedText("应用", "Application"), style = MaterialTheme.typography.titleSmall)
         SettingsCard {
-            AboutValueRow(localizedText("APP 版本号", "App version"), "v$versionName")
+            AboutValueRow(localizedText("APP 版本号", "App version"), "v${BuildConfig.VERSION_NAME}")
+            SettingsDivider()
+            AppUpdateContent(
+                state = updateState,
+                onCheck = { app.appUpdater.checkForUpdates(force = true) },
+                onDownload = app.appUpdater::download,
+                onInstall = installUpdate,
+                onOpenRelease = { release ->
+                    openAboutLink(context, release.pageUrl, localizedText("版本发布", "release"), onError)
+                },
+            )
         }
 
         Text(localizedText("关于", "About"), style = MaterialTheme.typography.titleSmall)
@@ -2064,6 +2109,112 @@ private fun AboutSettings(
         }
 
         Spacer(Modifier.height(28.dp))
+    }
+}
+
+@Composable
+private fun AppUpdateContent(
+    state: AppUpdateState,
+    onCheck: () -> Unit,
+    onDownload: (ReleaseInfo) -> Unit,
+    onInstall: (File) -> Unit,
+    onOpenRelease: (ReleaseInfo) -> Unit,
+) {
+    val colors = LocalChatColors.current
+    val release = when (state) {
+        is AppUpdateState.Available -> state.release
+        is AppUpdateState.Downloading -> state.release
+        is AppUpdateState.Downloaded -> state.release
+        else -> null
+    }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(localizedText("应用更新", "App updates"), style = MaterialTheme.typography.labelSmall, color = colors.tertiary)
+        Text(
+            when (state) {
+                AppUpdateState.Idle -> localizedText("尚未检查更新", "Updates have not been checked")
+                AppUpdateState.Checking -> localizedText("正在检查 GitHub Release…", "Checking GitHub Releases…")
+                is AppUpdateState.UpToDate -> localizedText("已是最新版本（${state.latestVersion}）", "You're up to date (${state.latestVersion})")
+                is AppUpdateState.Available -> localizedText("发现新版本 ${state.release.tagName}", "Version ${state.release.tagName} is available")
+                is AppUpdateState.Downloading -> {
+                    val percent = state.totalBytes?.takeIf { it > 0L }?.let { state.downloadedBytes * 100 / it }
+                    if (percent == null) {
+                        localizedText("正在下载 ${formatStorageBytes(state.downloadedBytes)}…", "Downloading ${formatStorageBytes(state.downloadedBytes)}…")
+                    } else {
+                        localizedText("正在下载… $percent%", "Downloading… $percent%")
+                    }
+                }
+                is AppUpdateState.Downloaded -> localizedText("安装包已下载，可以开始安装", "The update is ready to install")
+                is AppUpdateState.Error -> state.message
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (state is AppUpdateState.Error) colors.error else colors.text,
+        )
+        if (state is AppUpdateState.Downloading) {
+            val total = state.totalBytes
+            if (total != null && total > 0L) {
+                LinearProgressIndicator(
+                    progress = { (state.downloadedBytes.toFloat() / total.toFloat()).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+        }
+        if (release != null && release.notes.isNotBlank()) {
+            Text(
+                release.notes,
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.secondary,
+                maxLines = 5,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Button(
+            onClick = {
+                when (state) {
+                    is AppUpdateState.Available -> onDownload(state.release)
+                    is AppUpdateState.Downloaded -> onInstall(state.apkFile)
+                    else -> onCheck()
+                }
+            },
+            enabled = state !is AppUpdateState.Checking && state !is AppUpdateState.Downloading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag(
+                    when (state) {
+                        is AppUpdateState.Available -> "download_app_update"
+                        is AppUpdateState.Downloaded -> "install_app_update"
+                        else -> "check_app_update"
+                    },
+                ),
+            shape = RoundedCornerShape(15.dp),
+        ) {
+            Text(
+                when (state) {
+                    AppUpdateState.Checking -> localizedText("正在检查…", "Checking…")
+                    is AppUpdateState.Available -> localizedText(
+                        "下载更新（${formatStorageBytes(state.release.apk.sizeBytes)}）",
+                        "Download update (${formatStorageBytes(state.release.apk.sizeBytes)})",
+                    )
+                    is AppUpdateState.Downloading -> localizedText("正在下载…", "Downloading…")
+                    is AppUpdateState.Downloaded -> localizedText("安装更新", "Install update")
+                    else -> localizedText("检查更新", "Check for updates")
+                },
+            )
+        }
+        if (release != null) {
+            TextButton(onClick = { onOpenRelease(release) }, modifier = Modifier.fillMaxWidth()) {
+                Text(localizedText("查看 GitHub 发布说明", "View release notes on GitHub"))
+            }
+        }
+        Text(
+            localizedText(
+                "更新来自项目的 GitHub Release，请确保手机网能正常访问GitHub。",
+                "Updates come from this project's GitHub Releases. Please make sure that the mobile network can access GitHub normally.",
+            ),
+            style = MaterialTheme.typography.labelSmall,
+            color = colors.tertiary,
+        )
     }
 }
 

@@ -21,6 +21,35 @@ internal fun resolveDeviceExecutionMode(args: JsonObject): ExecutionMode =
         ExecutionMode.VIRTUAL_DISPLAY
     }
 
+/**
+ * Adds the model-written progress label used by compact UI surfaces to every device tool.
+ * The schema requirement is more reliable across OpenAI-compatible models than prompt text alone.
+ */
+internal fun deviceToolSchema(schema: String): String {
+    val root = TOOL_JSON.parseToJsonElement(localizedJsonSchema(schema)).jsonObject
+    val properties = root["properties"]?.jsonObject.orEmpty().toMutableMap().apply {
+        put("step_summary", buildJsonObject {
+            put("type", "string")
+            put("minLength", 1)
+            put("maxLength", 80)
+            put(
+                "description",
+                localizedText(
+                    "面向用户的一句话步骤摘要，只说明本步目的且省略“正在”“已完成”等状态词，例如“打开网络设置页面”；不要复述按钮名、坐标、输入内容、验证码、账号或其他敏感信息",
+                    "One-sentence user-facing summary of this step's purpose, without status words such as in progress or completed, for example: Open the network settings page. Do not repeat button labels, coordinates, entered text, verification codes, account details, or other sensitive information",
+                ),
+            )
+        })
+    }
+    val required = root["required"]?.jsonArray.orEmpty().toMutableList().apply {
+        if (none { it.jsonPrimitive.contentOrNull == "step_summary" }) add(JsonPrimitive("step_summary"))
+    }
+    return JsonObject(root.toMutableMap().apply {
+        put("properties", JsonObject(properties))
+        put("required", JsonArray(required))
+    }).toString()
+}
+
 class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
     private val sessionGate = Mutex()
     private val sessionsByRun = mutableMapOf<String, MutableSet<String>>()
@@ -65,7 +94,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         ToolDefinition(
             "device_list_apps", localizedText("获取本机应用列表", "Get installed app list"),
             localizedText("列出本机具有启动入口的应用名称和真实 package_name。打开应用前必须使用本工具返回的包名，不能翻译或猜测；带 query 返回 0 条时可再调用一次且不传 query。", "List app names and real package_name values for apps with launcher entries. Before opening an app, use the package name returned here without translating or guessing. If a query returns no result, call once more without query."),
-            localizedJsonSchema("""{"type":"object","properties":{"query":{"type":"string","maxLength":200,"description":localizedText("可选，按应用名称或包名筛选；不确定系统显示名称时省略", "Optional filter by app name or package name; omit when the system display name is uncertain")},"limit":{"type":"integer","minimum":1,"maximum":500,"default":200}},"additionalProperties":false}"""),
+            deviceToolSchema("""{"type":"object","properties":{"query":{"type":"string","maxLength":200,"description":localizedText("可选，按应用名称或包名筛选；不确定系统显示名称时省略", "Optional filter by app name or package name; omit when the system display name is uncertain")},"limit":{"type":"integer","minimum":1,"maximum":500,"default":200}},"additionalProperties":false}"""),
             ToolSideEffect.READ, "device",
             approvalDescription = localizedText("获取本机可以打开的应用列表。", "Get the list of apps that can be launched on this device."),
         ),
@@ -73,7 +102,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             "device_open",
             localizedText("开始手机操作", "Start phone operation"),
             localizedText("开启当前执行轮次专用的设备会话。mode 必须根据用户要求和任务目标选择：用户明确指定前台或后台时直接照做；未指定时，打开或切换应用、展示页面，以及需要用户看到当前屏幕结果的任务使用 main；能够在隔离屏独立完成且不应打扰当前屏幕的任务使用 virtual。不得为了选择前台或后台询问用户；后续只使用本次返回的 session_id。", "Open a device session dedicated to the current run. Choose mode from the user request and task goal: follow explicit foreground or background requests; otherwise use main for opening or switching apps, presenting pages, or results the user must see, and virtual for independent work on an isolated display that should not interrupt the current screen. Do not ask the user merely to choose foreground or background. Use only the returned session_id afterward."),
-            localizedJsonSchema("""{"type":"object","properties":{"mode":{"type":"string","enum":["main","virtual"],"description":localizedText("根据用户要求和任务目标选择。打开或切换应用、展示页面、需要用户看到屏幕结果时使用 main；可在隔离屏独立完成且不应打扰当前屏幕时使用 virtual", "Choose from the user request and task goal. Use main when opening or switching apps, presenting a page, or when the user must see the result. Use virtual when the work can finish independently on an isolated display without interrupting the current screen.")}},"required":["mode"],"additionalProperties":false}"""),
+            deviceToolSchema("""{"type":"object","properties":{"mode":{"type":"string","enum":["main","virtual"],"description":localizedText("根据用户要求和任务目标选择。打开或切换应用、展示页面、需要用户看到屏幕结果时使用 main；可在隔离屏独立完成且不应打扰当前屏幕时使用 virtual", "Choose from the user request and task goal. Use main when opening or switching apps, presenting a page, or when the user must see the result. Use virtual when the work can finish independently on an isolated display without interrupting the current screen.")}},"required":["mode"],"additionalProperties":false}"""),
             ToolSideEffect.EXTERNAL_WRITE,
             "device",
             approvalDescription = localizedText("开始一次手机操作。执行方式由用户要求和任务目标确定。", "Start a phone operation. The user request and task goal determine the execution mode."),
@@ -82,7 +111,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             "device_observe",
             localizedText("识别手机界面", "Inspect phone screen"),
             localizedText("读取当前设备会话的前台应用、截图、坐标范围和可访问节点，并返回一次性 observation_id。节点和截图只对紧接着的一次模型决策有效，随后自动清除；继续操作必须重新识别。可用 query 或 required_action 筛选复杂界面；nodes_truncated=true 时缩小条件重新识别。", "Read the foreground app, screenshot, coordinate range, and accessible nodes for the current device session, returning a one-time observation_id. Nodes and screenshots are valid only for the immediately following model decision and are then cleared; inspect again before continuing. Use query or required_action to filter complex screens, and narrow the filter when nodes_truncated=true."),
-            localizedJsonSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")},"query":{"type":"string","maxLength":200,"description":localizedText("可选，筛选文字、描述、提示、view_id 或类名", "Optional filter for text, description, hint, view_id, or class name")},"required_action":{"type":"string","enum":["click","long_click","scroll_forward","scroll_backward","scroll_up","scroll_down","scroll_left","scroll_right","set_text"]},"limit":{"type":"integer","minimum":1,"maximum":200,"default":80}},"required":["session_id"],"additionalProperties":false}"""),
+            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")},"query":{"type":"string","maxLength":200,"description":localizedText("可选，筛选文字、描述、提示、view_id 或类名", "Optional filter for text, description, hint, view_id, or class name")},"required_action":{"type":"string","enum":["click","long_click","scroll_forward","scroll_backward","scroll_up","scroll_down","scroll_left","scroll_right","set_text"]},"limit":{"type":"integer","minimum":1,"maximum":200,"default":80}},"required":["session_id"],"additionalProperties":false}"""),
             ToolSideEffect.READ,
             "device",
             approvalDescription = localizedText("识别当前界面，并把临时截图和节点信息交给当前模型分析。", "Inspect the current screen and provide the temporary screenshot and node information to the current model."),
@@ -91,7 +120,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         ToolDefinition(
             "device_action", localizedText("操作手机", "Phone control"),
             localizedText("每次只执行一个动作。优先使用 click_node、long_click_node、scroll_node 等节点语义动作；节点不支持时才使用坐标。open_app 可省略 observation_id；其他动作必须原样使用最近一次 device_observe 返回的准确 ID。动作成功后该识别结果立即失效，继续操作前必须重新识别。", "Run exactly one action. Prefer semantic node actions such as click_node, long_click_node, and scroll_node; use coordinates only when the node does not support the action. open_app may omit observation_id; every other action must copy the exact ID from the latest device_observe. A successful action immediately expires that observation, so inspect again before continuing."),
-            localizedJsonSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")},"observation_id":{"type":"string","description":localizedText("open_app 可省略；其他动作必须使用最近一次 device_observe 返回的一次性准确 ID", "open_app may omit this; every other action must use the one-time exact ID from the latest device_observe")},"action":{"type":"string","enum":["click_node","long_click_node","scroll_node","tap","long_press","swipe","input_text","back","enter","home","recents","escape","delete","tab","dpad_up","dpad_down","dpad_left","dpad_right","open_app","wait"]},"x":{"type":"integer","description":localizedText("点击或滑动起点横坐标，来自当前识别结果", "Tap or swipe start X coordinate from the current observation")},"y":{"type":"integer","description":localizedText("点击或滑动起点纵坐标，来自当前识别结果", "Tap or swipe start Y coordinate from the current observation")},"end_x":{"type":"integer","description":localizedText("滑动终点横坐标", "Swipe end X coordinate")},"end_y":{"type":"integer","description":localizedText("滑动终点纵坐标", "Swipe end Y coordinate")},"duration_ms":{"type":"integer"},"text":{"type":"string","maxLength":500,"description":localizedText("仅用于 input_text；replace 模式传空字符串可清空输入框", "Used only for input_text; an empty string in replace mode clears the field")},"input_mode":{"type":"string","enum":["replace","append"],"default":"replace"},"node_ref":{"type":"string","description":localizedText("节点语义动作必须提供；input_text 可选；值必须来自当前识别结果", "Node semantic action is required; input_text is optional; values must come from the current observation")},"scroll_direction":{"type":"string","enum":["forward","backward","up","down","left","right"],"description":localizedText("仅用于 scroll_node", "Used only for scroll_node")},"package_name":{"type":"string","description":localizedText("仅用于 open_app，必须原样复制 device_list_apps 返回的 package_name", "Used only for open_app; copy package_name exactly from device_list_apps")}},"required":["session_id","action"],"additionalProperties":false}"""),
+            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")},"observation_id":{"type":"string","description":localizedText("open_app 可省略；其他动作必须使用最近一次 device_observe 返回的一次性准确 ID", "open_app may omit this; every other action must use the one-time exact ID from the latest device_observe")},"action":{"type":"string","enum":["click_node","long_click_node","scroll_node","tap","long_press","swipe","input_text","back","enter","home","recents","escape","delete","tab","dpad_up","dpad_down","dpad_left","dpad_right","open_app","wait"]},"x":{"type":"integer","description":localizedText("点击或滑动起点横坐标，来自当前识别结果", "Tap or swipe start X coordinate from the current observation")},"y":{"type":"integer","description":localizedText("点击或滑动起点纵坐标，来自当前识别结果", "Tap or swipe start Y coordinate from the current observation")},"end_x":{"type":"integer","description":localizedText("滑动终点横坐标", "Swipe end X coordinate")},"end_y":{"type":"integer","description":localizedText("滑动终点纵坐标", "Swipe end Y coordinate")},"duration_ms":{"type":"integer"},"text":{"type":"string","maxLength":500,"description":localizedText("仅用于 input_text；replace 模式传空字符串可清空输入框", "Used only for input_text; an empty string in replace mode clears the field")},"input_mode":{"type":"string","enum":["replace","append"],"default":"replace"},"node_ref":{"type":"string","description":localizedText("节点语义动作必须提供；input_text 可选；值必须来自当前识别结果", "Node semantic action is required; input_text is optional; values must come from the current observation")},"scroll_direction":{"type":"string","enum":["forward","backward","up","down","left","right"],"description":localizedText("仅用于 scroll_node", "Used only for scroll_node")},"package_name":{"type":"string","description":localizedText("仅用于 open_app，必须原样复制 device_list_apps 返回的 package_name", "Used only for open_app; copy package_name exactly from device_list_apps")}},"required":["session_id","action"],"additionalProperties":false}"""),
             ToolSideEffect.EXTERNAL_WRITE, "device",
             approvalDescription = localizedText("在手机上执行一次操作。", "Run one action on the phone."),
         ),
@@ -106,14 +135,14 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         ToolDefinition(
             "device_gesture", localizedText("执行复杂触控", "Run complex touch gesture"),
             localizedText("在最近一次识别结果的坐标系中执行一组轨迹。单条多点轨迹可在画板连续画线；多条 start_time_ms 相同的轨迹会并行执行，可用于双指缩放。一次最多 10 条轨迹、共 500 个点、总时长 10 秒。", "Execute gesture paths in the coordinate system of the latest observation. A multi-point path can draw continuously; paths with the same start_time_ms run in parallel for gestures such as pinch zoom. Up to 10 paths, 500 points total, and 10 seconds."),
-            localizedJsonSchema("""{"type":"object","properties":{"session_id":{"type":"string"},"observation_id":{"type":"string","description":localizedText("最近一次 device_observe 返回的准确 ID", "Exact ID returned by the latest device_observe")},"strokes":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"points":{"type":"array","minItems":2,"maxItems":500,"items":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"],"additionalProperties":false}},"start_time_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"duration_ms":{"type":"integer","minimum":1,"maximum":10000}},"required":["points","duration_ms"],"additionalProperties":false}}},"required":["session_id","observation_id","strokes"],"additionalProperties":false}"""),
+            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string"},"observation_id":{"type":"string","description":localizedText("最近一次 device_observe 返回的准确 ID", "Exact ID returned by the latest device_observe")},"strokes":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"points":{"type":"array","minItems":2,"maxItems":500,"items":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"],"additionalProperties":false}},"start_time_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"duration_ms":{"type":"integer","minimum":1,"maximum":10000}},"required":["points","duration_ms"],"additionalProperties":false}}},"required":["session_id","observation_id","strokes"],"additionalProperties":false}"""),
             ToolSideEffect.EXTERNAL_WRITE, "device",
             approvalDescription = localizedText("在手机上执行连续轨迹或多指手势。", "Run continuous paths or multi-touch gestures on the phone."),
         ),
         ToolDefinition(
             "device_wait_for", localizedText("等待界面状态", "Wait for screen state"),
             localizedText("在设备会话中轮询识别，直到指定文字、节点、应用出现或消失，并返回仅供下一步使用的最新 observation_id 和截图。适合加载、跳转和弹窗等待，不能用来无限等待。", "Poll screen observations in the device session until specified text, node, or app appears or disappears, returning the latest observation_id and screenshot for the next step only. Use for loading, navigation, and dialogs, not unbounded waits."),
-            localizedJsonSchema("""{"type":"object","properties":{"session_id":{"type":"string"},"state":{"type":"string","enum":["present","absent"],"default":"present"},"text":{"type":"string","maxLength":200,"description":localizedText("匹配节点文字、描述或提示文字，忽略大小写", "Match node text, description, or hint, ignoring case")},"node_ref":{"type":"string","description":localizedText("匹配先前识别结果中的节点引用", "Match a node reference from the prior observation")},"package_name":{"type":"string","description":localizedText("匹配当前前台应用包名", "Match current foreground app package name")},"timeout_ms":{"type":"integer","minimum":0,"maximum":10000,"default":5000},"interval_ms":{"type":"integer","minimum":200,"maximum":2000,"default":500}},"required":["session_id"],"additionalProperties":false}"""),
+            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string"},"state":{"type":"string","enum":["present","absent"],"default":"present"},"text":{"type":"string","maxLength":200,"description":localizedText("匹配节点文字、描述或提示文字，忽略大小写", "Match node text, description, or hint, ignoring case")},"node_ref":{"type":"string","description":localizedText("匹配先前识别结果中的节点引用", "Match a node reference from the prior observation")},"package_name":{"type":"string","description":localizedText("匹配当前前台应用包名", "Match current foreground app package name")},"timeout_ms":{"type":"integer","minimum":0,"maximum":10000,"default":5000},"interval_ms":{"type":"integer","minimum":200,"maximum":2000,"default":500}},"required":["session_id"],"additionalProperties":false}"""),
             ToolSideEffect.READ, "device",
             approvalDescription = localizedText("等待手机界面达到指定状态，并把最终临时截图交给当前模型分析。", "Wait for the phone screen to reach a specified state and provide the final temporary screenshot to the current model."),
             resultLifetime = ToolResultLifetime.SINGLE_MODEL_STEP,
@@ -122,7 +151,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             "device_close",
             localizedText("结束手机操作", "End phone operation"),
             localizedText("结束当前执行轮次中 device_open 创建的设备会话并释放资源。只能使用本轮返回的 session_id；正常结束时运行时也会自动清理。", "End the device session created by device_open in the current run and release resources. Use only the session_id returned in this run; the runtime also cleans it up after normal completion."),
-            localizedJsonSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")}},"required":["session_id"],"additionalProperties":false}"""),
+            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")}},"required":["session_id"],"additionalProperties":false}"""),
             ToolSideEffect.EXTERNAL_WRITE,
             "device",
             approvalDescription = localizedText("结束本次手机操作。", "End this phone operation."),
@@ -1012,7 +1041,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         )
 
         val BATCH_SCHEMA: String
-            get() = localizedJsonSchema("""
+            get() = deviceToolSchema("""
             {
               "type":"object",
               "properties":{

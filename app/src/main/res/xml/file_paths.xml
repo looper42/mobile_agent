@@ -8,4 +8,8 @@
     <files-path
         name="shared_attachments"
         path="shared-attachments/" />
+    <!-- GitHub Release 下载的 APK 只通过临时读授权交给系统安装器。 -->
+    <cache-path
+        name="app_updates"
+        path="app-updates/" />
 </paths>

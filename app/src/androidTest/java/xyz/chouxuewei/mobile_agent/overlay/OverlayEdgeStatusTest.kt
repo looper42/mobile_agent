@@ -92,6 +92,8 @@ class OverlayEdgeStatusTest {
         override fun openConversation() = Unit
         override fun selectConversation(id: String) = Unit
         override fun editDraft(draft: ComposerDraft) = Unit
+        override fun requestInputFocus() = Unit
+        override fun releaseInputFocus() = Unit
         override fun sendMessage() = Unit
         override fun startVoiceInput() = false
         override fun finishVoiceInput(action: OverlayVoiceReleaseAction) = Unit

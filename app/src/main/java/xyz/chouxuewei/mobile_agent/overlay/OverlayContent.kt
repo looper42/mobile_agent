@@ -13,8 +13,10 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -46,17 +48,21 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
@@ -89,6 +95,7 @@ import xyz.chouxuewei.mobile_agent.ui.theme.LocalChatColors
 import xyz.chouxuewei.mobile_agent.ui.theme.Mobile_agentTheme
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputState
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.launch
 import android.os.SystemClock
 
 internal data class VirtualScreenPreview(
@@ -129,6 +136,8 @@ internal interface OverlayActions {
     fun openConversation()
     fun selectConversation(id: String)
     fun editDraft(draft: ComposerDraft)
+    fun requestInputFocus()
+    fun releaseInputFocus()
     fun sendMessage()
     fun startVoiceInput(): Boolean
     fun finishVoiceInput(action: OverlayVoiceReleaseAction)
@@ -456,6 +465,7 @@ private fun FullChatOverlay(state: OverlayViewState, actions: OverlayActions) {
                         )
                     }
                     OverlayTimeline(state, Modifier.weight(1f))
+                    OverlayReasoningIndicator(state)
                     if (approval != null) {
                         ApprovalCard(approval, actions)
                     } else if (question != null) {
@@ -872,12 +882,80 @@ private fun ConversationRow(conversation: Conversation, state: OverlayViewState,
     }
 }
 
+internal data class OverlayReasoningIndicatorState(val durationMillis: Long?)
+
+internal fun overlayReasoningIndicatorState(state: OverlayViewState): OverlayReasoningIndicatorState? {
+    val message = state.messages.lastOrNull {
+        it.role == MessageRole.ASSISTANT && it.status == MessageStatus.GENERATING
+    } ?: return null
+    val currentStep = message.assistantSteps.lastOrNull()
+    val active = when {
+        currentStep != null -> currentStep.reasoning.isNotBlank() &&
+            currentStep.toolCallIds.isEmpty() && currentStep.text.isEmpty()
+        else -> message.reasoningSteps.any(String::isNotBlank)
+    }
+    return if (active) {
+        OverlayReasoningIndicatorState(currentStep?.reasoningDurationMillis ?: message.reasoningDurationMillis)
+    } else {
+        null
+    }
+}
+
+@Composable
+private fun OverlayReasoningIndicator(state: OverlayViewState) {
+    val status = overlayReasoningIndicatorState(state) ?: return
+    val colors = LocalChatColors.current
+    Box(
+        Modifier.fillMaxWidth().padding(start = 10.dp, top = 5.dp, end = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            Modifier.shadow(6.dp, RoundedCornerShape(18.dp)).testTag("overlay_reasoning_status"),
+            shape = RoundedCornerShape(18.dp),
+            color = colors.surfaceRaised,
+            border = BorderStroke(1.dp, colors.divider),
+        ) {
+            Row(
+                Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ChatIcon(R.drawable.lucide_brain_circuit, null, Modifier.size(16.dp), colors.tertiary)
+                Text(
+                    localizedText(
+                        "思考中 · ${formatOverlayReasoningDuration(status.durationMillis)}",
+                        "Reasoning · ${formatOverlayReasoningDuration(status.durationMillis)}",
+                    ),
+                    Modifier.padding(start = 7.dp),
+                    color = colors.secondary,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun OverlayTimeline(state: OverlayViewState, modifier: Modifier) {
     val list = rememberLazyListState()
-    LaunchedEffect(state.selectedConversationId, state.messages.size, state.messages.lastOrNull()?.text,
-        state.toolCalls.lastOrNull()?.status) {
-        if (state.messages.isNotEmpty()) list.scrollToItem(state.messages.lastIndex)
+    val scope = rememberCoroutineScope()
+    // 每次进入展开态或切换会话都默认跟随底部；用户手动上滑后只在本次展开期间停止跟随。
+    var follow by remember(state.selectedConversationId) { mutableStateOf(true) }
+    var programmaticScroll by remember { mutableStateOf(false) }
+    val latestIndex = state.messages.size
+    LaunchedEffect(list) {
+        snapshotFlow { list.isScrollInProgress to list.canScrollForward }.collect { (scrolling, below) ->
+            if (scrolling && !programmaticScroll) follow = !below
+        }
+    }
+    LaunchedEffect(
+        state.selectedConversationId,
+        state.messages.size,
+        state.messages.lastOrNull()?.text,
+        state.messages.lastOrNull()?.assistantSteps,
+        state.toolCalls.size,
+        state.toolCalls.lastOrNull()?.status,
+    ) {
+        if (follow && state.messages.isNotEmpty()) list.scrollToItem(latestIndex)
     }
     if (state.messages.isEmpty()) {
         Box(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -886,14 +964,43 @@ private fun OverlayTimeline(state: OverlayViewState, modifier: Modifier) {
         }
         return
     }
-    LazyColumn(
-        state = list,
-        modifier = modifier.fillMaxWidth().testTag("overlay_messages"),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        items(state.messages, key = Message::id) { message ->
-            OverlayMessage(message, state.toolCalls.filter { it.replyMessageId == message.id }, state.toolTitles)
+    Box(modifier.fillMaxWidth()) {
+        LazyColumn(
+            state = list,
+            modifier = Modifier.fillMaxSize().testTag("overlay_messages"),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            items(state.messages, key = Message::id) { message ->
+                OverlayMessage(message, state.toolCalls.filter { it.replyMessageId == message.id }, state.toolTitles)
+            }
+            // 独立末尾锚点让默认/跟随滚动落在内容底部，而不是最后一条消息的开头。
+            item(key = "overlay_timeline_bottom") { Spacer(Modifier.height(1.dp)) }
+        }
+        if (!follow) {
+            Surface(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp)
+                    .shadow(8.dp, RoundedCornerShape(20.dp)).clickable {
+                        scope.launch {
+                            programmaticScroll = true
+                            try {
+                                list.animateScrollToItem(latestIndex)
+                                follow = true
+                            } finally {
+                                programmaticScroll = false
+                            }
+                        }
+                    },
+                shape = RoundedCornerShape(20.dp),
+                color = LocalChatColors.current.surface,
+                border = BorderStroke(1.dp, LocalChatColors.current.divider),
+            ) {
+                Text(
+                    localizedText("回到最新", "Jump to latest"),
+                    Modifier.padding(horizontal = 15.dp, vertical = 9.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
         }
     }
 }
@@ -901,8 +1008,6 @@ private fun OverlayTimeline(state: OverlayViewState, modifier: Modifier) {
 @Composable
 private fun OverlayMessage(message: Message, calls: List<ToolCallRecord>, toolTitles: Map<String, String>) {
     val colors = LocalChatColors.current
-    val toolGroups = groupOverlayToolCalls(calls)
-    var completedExpanded by rememberSaveable(message.id) { mutableStateOf(false) }
     Column(
         Modifier.fillMaxWidth(),
         horizontalAlignment = if (message.role == MessageRole.USER) Alignment.End else Alignment.Start,
@@ -924,38 +1029,76 @@ private fun OverlayMessage(message: Message, calls: List<ToolCallRecord>, toolTi
         } else {
             Text("Mobile Agent", color = colors.secondary, style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.SemiBold)
-            val reasoning = message.assistantSteps.lastOrNull { it.reasoning.isNotBlank() }?.reasoning
-                ?: message.reasoningSteps.lastOrNull()
-            if (!reasoning.isNullOrBlank() && message.status == MessageStatus.GENERATING) {
-                Surface(
-                    Modifier.fillMaxWidth().padding(top = 5.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    color = colors.surfaceRaised,
-                ) {
-                    Text(
-                        localizedText("思考 · ${reasoning.takeLast(500)}", "Reasoning · ${reasoning.takeLast(500)}"),
-                        Modifier.padding(10.dp),
-                        color = colors.secondary,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-            }
-            if (toolGroups.completed.size > 1) {
-                CompletedToolsRow(
-                    calls = toolGroups.completed,
-                    toolTitles = toolTitles,
-                    expanded = completedExpanded,
-                    onToggle = { completedExpanded = !completedExpanded },
-                )
-            } else {
-                toolGroups.completed.forEach { call -> CompactToolRow(call, toolTitles) }
-            }
-            toolGroups.highlighted.forEach { call -> CompactToolRow(call, toolTitles) }
-            if (message.text.isNotBlank()) {
-                Column(Modifier.fillMaxWidth().padding(top = 7.dp, end = 5.dp)) { ReplyBody(message.text) }
-            } else if (message.status == MessageStatus.GENERATING && calls.isEmpty()) {
+            val steps = buildOverlayMessageSteps(message, calls, toolTitles)
+            if (steps.isNotEmpty()) {
+                OverlayMessageStepper(steps)
+            } else if (message.status == MessageStatus.GENERATING && calls.isEmpty() &&
+                message.reasoningSteps.isEmpty() && message.assistantSteps.none { it.reasoning.isNotBlank() }) {
                 Text(localizedText("正在生成…", "Generating…"), Modifier.padding(top = 7.dp), color = colors.secondary,
                     style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
+}
+
+@Composable
+private fun OverlayMessageStepper(steps: List<OverlayMessageStep>) {
+    Column(Modifier.fillMaxWidth().padding(top = 9.dp)) {
+        steps.forEachIndexed { index, step ->
+            OverlayMessageStepRow(step, isLast = index == steps.lastIndex)
+        }
+    }
+}
+
+@Composable
+private fun OverlayMessageStepRow(step: OverlayMessageStep, isLast: Boolean) {
+    val colors = LocalChatColors.current
+    val foreground = when (step.status) {
+        ToolCallStatus.SUCCEEDED -> colors.success
+        ToolCallStatus.FAILED, ToolCallStatus.DENIED, ToolCallStatus.CANCELLED,
+        ToolCallStatus.INTERRUPTED -> colors.error
+        ToolCallStatus.RECEIVED, ToolCallStatus.EXECUTING -> colors.accent
+        ToolCallStatus.WAITING_APPROVAL -> colors.warning
+        null -> colors.accent
+    }
+    Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+        Column(
+            Modifier.width(24.dp).fillMaxHeight(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            when (step.status) {
+                ToolCallStatus.SUCCEEDED ->
+                    ChatIcon(R.drawable.lucide_circle_check, null, Modifier.size(18.dp), foreground)
+                ToolCallStatus.FAILED, ToolCallStatus.DENIED, ToolCallStatus.CANCELLED,
+                ToolCallStatus.INTERRUPTED ->
+                    ChatIcon(R.drawable.lucide_x, null, Modifier.size(18.dp), foreground)
+                ToolCallStatus.RECEIVED, ToolCallStatus.EXECUTING ->
+                    CircularProgressIndicator(Modifier.size(16.dp), color = foreground, strokeWidth = 2.dp)
+                else -> ChatIcon(R.drawable.lucide_sparkles, null, Modifier.size(18.dp), foreground)
+            }
+            if (!isLast) {
+                Box(Modifier.padding(top = 3.dp).width(2.dp).weight(1f).background(colors.divider))
+            }
+        }
+        Column(
+            Modifier.weight(1f).padding(start = 8.dp, end = 4.dp, bottom = if (isLast) 2.dp else 15.dp),
+        ) {
+            Text(
+                step.title,
+                color = foreground,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+            step.detail?.takeIf(String::isNotBlank)?.let { detail ->
+                Text(
+                    detail,
+                    Modifier.padding(top = 4.dp),
+                    color = colors.secondary,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            step.replyText?.let { reply ->
+                Column(Modifier.fillMaxWidth().padding(top = 5.dp)) { ReplyBody(reply) }
             }
         }
     }
@@ -1062,7 +1205,8 @@ private fun QuestionCard(request: UserQuestionRequest, actions: OverlayActions) 
                     value = answer,
                     onValueChange = { answer = it.take(2_000) },
                     enabled = !submitting,
-                    modifier = Modifier.fillMaxWidth().background(colors.surface, RoundedCornerShape(12.dp))
+                    modifier = Modifier.fillMaxWidth().overlayTextInput(actions)
+                        .background(colors.surface, RoundedCornerShape(12.dp))
                         .padding(horizontal = 11.dp, vertical = 10.dp),
                     textStyle = MaterialTheme.typography.bodyMedium.copy(color = colors.text),
                     cursorBrush = SolidColor(colors.accent),
@@ -1115,7 +1259,8 @@ private fun OverlayComposer(state: OverlayViewState, actions: OverlayActions, mo
             BasicTextField(
                 value = state.draft.text,
                 onValueChange = { actions.editDraft(state.draft.copy(text = it)) },
-                modifier = Modifier.weight(1f).heightIn(min = 48.dp, max = 104.dp).padding(vertical = 11.dp),
+                modifier = Modifier.weight(1f).heightIn(min = 48.dp, max = 104.dp)
+                    .overlayTextInput(actions).padding(vertical = 11.dp),
                 maxLines = 4,
                 textStyle = MaterialTheme.typography.bodyMedium.copy(color = colors.text),
                 cursorBrush = SolidColor(colors.accent),
@@ -1229,84 +1374,28 @@ private fun StatusBadge(state: OverlayViewState, size: Dp) {
     }
 }
 
-@Composable
-private fun CompletedToolsRow(
-    calls: List<ToolCallRecord>,
-    toolTitles: Map<String, String>,
-    expanded: Boolean,
-    onToggle: () -> Unit,
-) {
-    val colors = LocalChatColors.current
-    Surface(
-        Modifier.fillMaxWidth().padding(top = 5.dp)
-            .clickable(role = Role.Button, onClick = onToggle)
-            .testTag("overlay_completed_tools"),
-        shape = RoundedCornerShape(12.dp),
-        color = colors.successSoft,
-    ) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            ChatIcon(R.drawable.lucide_circle_check, null, Modifier.size(18.dp), colors.success)
-            Column(Modifier.weight(1f).padding(horizontal = 9.dp)) {
-                Text(localizedText("已完成 ${calls.size} 步", "Completed ${calls.size} steps"), style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold)
-                Text(
-                    toolTitles[calls.last().toolId] ?: localizedText("最近一步已完成", "Latest step completed"),
-                    color = colors.secondary,
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            ChatIcon(
-                if (expanded) R.drawable.lucide_chevron_down else R.drawable.lucide_chevron_right,
-                if (expanded) localizedText("收起已完成步骤", "Hide completed steps") else localizedText("展开已完成步骤", "Show completed steps"),
-                Modifier.size(17.dp),
-                colors.secondary,
-            )
+/**
+ * 完整悬浮窗默认保持不可聚焦，避免仅仅展开就让前台应用失去窗口焦点。
+ * 只有用户直接按下文本框时才临时切换窗口焦点；文本框失焦后立即归还。
+ */
+private fun Modifier.overlayTextInput(actions: OverlayActions): Modifier =
+    pointerInput(actions) {
+        awaitEachGesture {
+            awaitFirstDown(requireUnconsumed = false)
+            actions.requestInputFocus()
         }
+    }.onFocusChanged { focusState ->
+        if (!focusState.isFocused) actions.releaseInputFocus()
     }
-    if (expanded) calls.forEach { call -> CompactToolRow(call, toolTitles) }
-}
 
-@Composable
-private fun CompactToolRow(call: ToolCallRecord, toolTitles: Map<String, String>) {
-    val colors = LocalChatColors.current
-    val (foreground, container) = when (call.status) {
-        ToolCallStatus.SUCCEEDED -> colors.success to colors.successSoft
-        ToolCallStatus.FAILED -> colors.error to colors.errorSoft
-        ToolCallStatus.RECEIVED, ToolCallStatus.EXECUTING -> colors.accent to colors.accentSoft
-        else -> colors.secondary to colors.surfaceRaised
-    }
-    Surface(
-        Modifier.fillMaxWidth().padding(top = 5.dp),
-        shape = RoundedCornerShape(12.dp),
-        color = container,
-    ) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(Modifier.size(7.dp).background(foreground, CircleShape))
-            Column(Modifier.weight(1f).padding(start = 10.dp)) {
-                Text(
-                    "${toolStatusText(call.status)} · ${toolTitles[call.toolId] ?: localizedText("工具调用", "Tool calls")}",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    call.displaySummary ?: call.error ?: toolStatusText(call.status),
-                    color = colors.secondary,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
+private fun formatOverlayReasoningDuration(durationMillis: Long?): String {
+    val totalSeconds = maxOf(1L, ((durationMillis ?: 0L) + 999L) / 1_000L)
+    val minutes = totalSeconds / 60L
+    val seconds = totalSeconds % 60L
+    return if (minutes == 0L) {
+        localizedText("${seconds} 秒", "${seconds} sec")
+    } else {
+        localizedText("${minutes} 分 ${seconds} 秒", "${minutes} min ${seconds} sec")
     }
 }
 
@@ -1389,17 +1478,6 @@ private fun conversationStatus(id: String, state: OverlayViewState): Pair<String
         id == state.completionConversationId -> localizedText("刚刚完成", "Just completed") to colors.success
         else -> localizedText("最近使用", "Recently used") to colors.tertiary
     }
-}
-
-private fun toolStatusText(status: ToolCallStatus): String = when (status) {
-    ToolCallStatus.RECEIVED -> localizedText("准备中", "Preparing")
-    ToolCallStatus.WAITING_APPROVAL -> localizedText("等待确认", "Waiting for approval")
-    ToolCallStatus.EXECUTING -> localizedText("执行中", "Running")
-    ToolCallStatus.SUCCEEDED -> localizedText("已完成", "Completed")
-    ToolCallStatus.FAILED -> localizedText("未完成", "Not completed")
-    ToolCallStatus.DENIED -> localizedText("未授权", "Not authorized")
-    ToolCallStatus.CANCELLED -> localizedText("已停止", "Stopped")
-    ToolCallStatus.INTERRUPTED -> localizedText("已中断", "Interrupted")
 }
 
 private const val RECENT_CONVERSATION_LIMIT = 5

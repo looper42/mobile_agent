@@ -1,7 +1,12 @@
 package xyz.chouxuewei.mobile_agent.overlay
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
+import xyz.chouxuewei.mobile_agent.core.AssistantStep
+import xyz.chouxuewei.mobile_agent.core.Message
+import xyz.chouxuewei.mobile_agent.core.MessageRole
+import xyz.chouxuewei.mobile_agent.core.MessageStatus
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputSource
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputState
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputTarget
@@ -41,4 +46,31 @@ class OverlayStatusKindTest {
 
         assertEquals(OverlayStatusKind.TRANSCRIBING, overlayStatusKind(state, global = true))
     }
+
+    @Test
+    fun `reasoning indicator only represents the currently active reasoning step`() {
+        val reasoning = assistantMessage(
+            AssistantStep(reasoning = "internal reasoning", reasoningDurationMillis = 2_500L),
+        )
+        assertEquals(
+            OverlayReasoningIndicatorState(2_500L),
+            overlayReasoningIndicatorState(OverlayViewState(messages = listOf(reasoning))),
+        )
+
+        val executingTool = assistantMessage(
+            AssistantStep(reasoning = "internal reasoning", toolCallIds = listOf("call"), reasoningDurationMillis = 2_500L),
+        )
+        assertNull(overlayReasoningIndicatorState(OverlayViewState(messages = listOf(executingTool))))
+    }
+
+    private fun assistantMessage(step: AssistantStep) = Message(
+        id = "assistant",
+        conversationId = "conversation",
+        sequence = 1L,
+        role = MessageRole.ASSISTANT,
+        text = step.text,
+        status = MessageStatus.GENERATING,
+        createdAt = 1L,
+        assistantSteps = listOf(step),
+    )
 }

@@ -116,6 +116,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
     private var overlayY: Int? = null
     private var fullWidth = 0
     private var fullHeight = 0
+    private var inputFocusActive = false
     private var edgeDragX = 0f
     private var summaryDragX = 0f
     private var fullDragSession: FullDragSession? = null
@@ -133,7 +134,12 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             val id = conversationId ?: return
             app.chatWorkspace.edit(id, draft)
         }
-        override fun sendMessage() = this@DeviceOperationOverlayService.sendMessage()
+        override fun requestInputFocus() = setInputFocusActive(true)
+        override fun releaseInputFocus() = setInputFocusActive(false)
+        override fun sendMessage() {
+            setInputFocusActive(false)
+            this@DeviceOperationOverlayService.sendMessage()
+        }
         override fun startVoiceInput() = this@DeviceOperationOverlayService.startVoiceInput()
         override fun finishVoiceInput(action: OverlayVoiceReleaseAction) =
             this@DeviceOperationOverlayService.finishVoiceInput(action)
@@ -147,6 +153,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             scope.launch { app.chatRuntime.decideTool(request.callId, allow, choiceId, permanently) }
         }
         override fun answerQuestion(request: UserQuestionRequest, answer: String?) {
+            setInputFocusActive(false)
             scope.launch { app.userQuestions.respond(request.id, answer) }
         }
         override fun dragEdge(dx: Float, dy: Float, finished: Boolean) = onEdgeDrag(dx, dy, finished)
@@ -396,6 +403,9 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         val before = presentation.presentation
         presentation.change()
         if (before != presentation.presentation) {
+            if (presentation.presentation != OverlayPresentation.FULL_CHAT) {
+                inputFocusActive = false
+            }
             fullDragSession = null
             resizeHint = null
             applyPresentation(before, dockEdgeOverride)
@@ -541,6 +551,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         val (width, height) = desiredSize(bounds)
         params.width = width
         params.height = height
+        if (presentation.presentation != OverlayPresentation.FULL_CHAT) inputFocusActive = false
         params.flags = windowFlags()
         when (presentation.presentation) {
             OverlayPresentation.EDGE_HANDLE, OverlayPresentation.SUMMARY -> {
@@ -608,8 +619,22 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
 
     private fun windowFlags(): Int = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-        if (presentation.presentation == OverlayPresentation.FULL_CHAT) 0
-        else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        if (inputFocusActive) 0 else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+
+    private fun setInputFocusActive(active: Boolean) {
+        val next = active && presentation.presentation == OverlayPresentation.FULL_CHAT
+        if (inputFocusActive == next) return
+        inputFocusActive = next
+        val params = layout ?: return
+        params.flags = windowFlags()
+        windowController.update()
+        if (!next) {
+            overlay?.let { view ->
+                getSystemService(InputMethodManager::class.java)
+                    .hideSoftInputFromWindow(view.windowToken, 0)
+            }
+        }
+    }
 
     private fun edgeX(bounds: Rect, width: Int): Int {
         val margin = if (presentation.presentation == OverlayPresentation.EDGE_HANDLE) 0 else dp(8)
@@ -891,6 +916,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
     }
 
     private fun openConversation() {
+        setInputFocusActive(false)
         conversationId?.let(app.chatWorkspace::select)
         val before = presentation.presentation
         if (hasWork()) presentation.showSummary() else presentation.showEdgeHandle()
@@ -900,6 +926,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
     }
 
     private fun removeOverlay() {
+        inputFocusActive = false
         windowController.detach()?.let { overlayY = it }
         fullDragSession = null
         resizeSession = null
@@ -958,26 +985,36 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
     }
 
-    private fun ToolCallRecord.overlayStep(titles: Map<String, String>) = OverlayStep(
-        title = titles[toolId] ?: localizedText("手机操作", "Phone operation"),
-        state = when (status) {
-            ToolCallStatus.RECEIVED -> localizedText("准备中", "Preparing")
-            ToolCallStatus.WAITING_APPROVAL -> localizedText("等待确认", "Waiting for approval")
-            ToolCallStatus.EXECUTING -> localizedText("执行中", "Running")
-            ToolCallStatus.SUCCEEDED -> localizedText("已完成", "Completed")
-            ToolCallStatus.FAILED -> localizedText("未完成", "Not completed")
-            ToolCallStatus.DENIED -> localizedText("未授权", "Not authorized")
-            ToolCallStatus.CANCELLED -> localizedText("已停止", "Stopped")
-            ToolCallStatus.INTERRUPTED -> localizedText("已中断", "Interrupted")
-        },
-        detail = when (status) {
-            ToolCallStatus.FAILED, ToolCallStatus.DENIED, ToolCallStatus.CANCELLED,
-            ToolCallStatus.INTERRUPTED -> displaySummary
-                ?: error?.let { userFacingMessage(it, localizedText("操作未完成", "Operation not completed")) }
-                ?: localizedText("操作未完成", "Operation not completed")
-            else -> operationDetail() ?: displaySummary ?: localizedText("准备中", "Preparing")
-        },
-    )
+    private fun ToolCallRecord.overlayStep(titles: Map<String, String>): OverlayStep {
+        val stepSummary = modelStepSummary(argumentsJson)
+        return OverlayStep(
+            title = titles[toolId] ?: localizedText("手机操作", "Phone operation"),
+            state = when (status) {
+                ToolCallStatus.RECEIVED -> localizedText("准备中", "Preparing")
+                ToolCallStatus.WAITING_APPROVAL -> localizedText("等待确认", "Waiting for approval")
+                ToolCallStatus.EXECUTING -> localizedText("执行中", "Running")
+                ToolCallStatus.SUCCEEDED -> localizedText("已完成", "Completed")
+                ToolCallStatus.FAILED -> localizedText("未完成", "Not completed")
+                ToolCallStatus.DENIED -> localizedText("未授权", "Not authorized")
+                ToolCallStatus.CANCELLED -> localizedText("已停止", "Stopped")
+                ToolCallStatus.INTERRUPTED -> localizedText("已中断", "Interrupted")
+            },
+            detail = when {
+                status in setOf(
+                    ToolCallStatus.FAILED,
+                    ToolCallStatus.DENIED,
+                    ToolCallStatus.CANCELLED,
+                    ToolCallStatus.INTERRUPTED,
+                ) -> displaySummary
+                    ?: error?.let { userFacingMessage(it, localizedText("操作未完成", "Operation not completed")) }
+                    ?: localizedText("操作未完成", "Operation not completed")
+                stepSummary != null && status == ToolCallStatus.SUCCEEDED ->
+                    localizedText("已完成：$stepSummary", "Completed: $stepSummary")
+                stepSummary != null -> localizedText("正在执行：$stepSummary", "In progress: $stepSummary")
+                else -> operationDetail() ?: displaySummary ?: localizedText("准备中", "Preparing")
+            },
+        )
+    }
 
     /** 参数仅用于生成不泄露输入内容的动作摘要，不把原始 JSON 或用户文本放到其它应用上方。 */
     private fun ToolCallRecord.operationDetail(): String? {
