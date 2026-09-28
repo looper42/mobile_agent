@@ -4,6 +4,7 @@ import android.content.Context
 import xyz.chouxuewei.mobile_agent.core.ArtifactStore
 import xyz.chouxuewei.mobile_agent.core.ConversationStore
 import xyz.chouxuewei.mobile_agent.core.DeviceGateway
+import xyz.chouxuewei.mobile_agent.core.SkillCreator
 import xyz.chouxuewei.mobile_agent.core.ToolRegistry
 import xyz.chouxuewei.mobile_agent.core.UserQuestionBroker
 
@@ -13,6 +14,7 @@ object ToolCatalog {
         conversations: ConversationStore,
         artifacts: ArtifactStore,
         device: DeviceGateway,
+        skills: SkillCreator,
         questions: UserQuestionBroker,
     ): ToolRegistry = ToolRegistry(
         listOf(
@@ -21,6 +23,7 @@ object ToolCatalog {
             ImageRenderToolProvider(context, artifacts),
             NetworkToolProvider(),
             DeviceToolProvider(device),
+            SkillToolProvider(skills),
             ClipboardToolProvider(context),
             NotificationToolProvider(context),
             SystemToolProvider(context),

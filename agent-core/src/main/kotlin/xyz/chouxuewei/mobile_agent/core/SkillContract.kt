@@ -61,8 +61,16 @@ interface SkillInstructionResolver {
     suspend fun resolveSkills(refs: List<SkillRef>): List<ResolvedSkill>
 }
 
+/** Narrow write boundary used by tools that may create a Skill but must not manage existing ones. */
+interface SkillCreator {
+    suspend fun create(
+        draft: SkillDraft,
+        source: SkillSource = SkillSource.CREATED,
+    ): SkillSummary
+}
+
 /** UI/application-facing skill catalog. */
-interface SkillCatalog {
+interface SkillCatalog : SkillCreator {
     val summaries: Flow<List<SkillSummary>>
     val preferences: Flow<SkillUsagePreferences>
 
@@ -72,7 +80,6 @@ interface SkillCatalog {
     suspend fun bindConversation(conversationId: String, skill: SkillRef)
     suspend fun unbindConversation(conversationId: String, skillId: String)
 
-    suspend fun create(draft: SkillDraft, source: SkillSource = SkillSource.CREATED): SkillSummary
     suspend fun update(skillId: String, draft: SkillDraft): SkillSummary
     suspend fun setEnabled(skillId: String, enabled: Boolean)
     suspend fun delete(skillId: String)

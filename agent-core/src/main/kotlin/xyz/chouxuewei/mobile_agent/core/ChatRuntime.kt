@@ -107,7 +107,7 @@ class ChatRuntime(
         recovery.await()
         conversationGates.computeIfAbsent(id) { Mutex() }.withLock {
             require(skills.size <= SkillLimits.MAX_SELECTED) {
-                localizedText("一次最多使用 ${SkillLimits.MAX_SELECTED} 个 Skill", "Use at most ${SkillLimits.MAX_SELECTED} Skills at a time.")
+                localizedText("一次最多使用 ${SkillLimits.MAX_SELECTED} 个技能", "Use at most ${SkillLimits.MAX_SELECTED} Skills at a time.")
             }
             val trigger = store.enqueue(id, text.trim(), attachments, skills.distinctBy(SkillRef::skillId))
             gate.withLock {
@@ -241,7 +241,13 @@ class ChatRuntime(
                 val activeBaseTurnCount = workingTurns.size
                 var contextWasCompacted = false
                 var toolRound = 0
+                var askedUserThisRun = false
                 while (true) {
+                    val requestDefinitions = if (askedUserThisRun) {
+                        definitions.filterNot { it.id == "ask_user" }
+                    } else {
+                        definitions
+                    }
                     check(!hasStepLimit || toolRound <= maxSteps) {
                         localizedText("已达到单轮最大步骤（$maxSteps），可在设置中调整后重试", "The maximum steps for one run ($maxSteps) was reached. Adjust it in Settings and try again.")
                     }
@@ -250,23 +256,23 @@ class ChatRuntime(
                     val step = StreamingAssistantStep()
                     assistantSteps += step
                     val requestedCalls = mutableListOf<RequestedToolCall>()
-                    if (compactActiveContext(workingTurns, activeBaseTurnCount, c.policy, definitions)) {
+                    if (compactActiveContext(workingTurns, activeBaseTurnCount, c.policy, requestDefinitions)) {
                         contextWasCompacted = true
                         notice(id, localizedText("上下文已自动压缩，任务继续执行", "Context was compressed automatically and the task will continue."))
                     }
-                    context.requireRequestFits(workingTurns, c.policy, definitions)
+                    context.requireRequestFits(workingTurns, c.policy, requestDefinitions)
                     publishContextUsage(
-                        id, c.policy, c.modelProfileId, workingTurns, definitions,
+                        id, c.policy, c.modelProfileId, workingTurns, requestDefinitions,
                         compacted = contextWasCompacted,
                     )
                     val requestStartedAt = System.currentTimeMillis()
                     var reportedUsage: ModelEvent.Usage? = null
                     AgentLog.d("Runtime") {
-                        "model_request run=${activeRun.id} round=$toolRound turns=${workingTurns.size} tools=${definitions.size} images=${workingTurns.sumOf { it.images.size }}"
+                        "model_request run=${activeRun.id} round=$toolRound turns=${workingTurns.size} tools=${requestDefinitions.size} images=${workingTurns.sumOf { it.images.size }}"
                     }
                     try {
                         c.gateway.stream(ChatRequest(
-                            workingTurns, c.policy.outputReserve, reasoningEffort, definitions,
+                            workingTurns, c.policy.outputReserve, reasoningEffort, requestDefinitions,
                         )).collect { event ->
                             when (event) {
                                 is ModelEvent.TextDelta -> {
@@ -296,7 +302,7 @@ class ChatRuntime(
                                             "model_usage run=${activeRun.id} round=$toolRound input=$actual output=${event.outputTokens ?: -1}"
                                         }
                                         publishContextUsage(
-                                            id, c.policy, c.modelProfileId, workingTurns, definitions,
+                                            id, c.policy, c.modelProfileId, workingTurns, requestDefinitions,
                                             actualInputTokens = actual,
                                             compacted = contextWasCompacted,
                                         )
@@ -313,7 +319,7 @@ class ChatRuntime(
                         // 清理改变了下一次请求的上下文；若没有清理，则保留服务端返回的真实 usage。
                         if (expired) {
                             publishContextUsage(
-                                id, c.policy, c.modelProfileId, workingTurns, definitions,
+                                id, c.policy, c.modelProfileId, workingTurns, requestDefinitions,
                                 compacted = contextWasCompacted,
                             )
                         }
@@ -327,7 +333,7 @@ class ChatRuntime(
                         if (finishReason == "length") notice(id, localizedText("本次回复已达到长度上限，你可以继续追问", "This response reached the length limit. You can ask a follow-up."))
                         break
                     }
-                    check(definitions.isNotEmpty()) { localizedText("模型请求了本轮未提供的工具", "The model requested a tool that was not provided for this run.") }
+                    check(requestDefinitions.isNotEmpty()) { localizedText("模型请求了本轮未提供的工具", "The model requested a tool that was not provided for this run.") }
                     check(!hasStepLimit || toolRound < maxSteps) {
                         localizedText("已达到单轮最大步骤（$maxSteps），可在设置中调整后重试", "The maximum steps for one run ($maxSteps) was reached. Adjust it in Settings and try again.")
                     }
@@ -344,14 +350,28 @@ class ChatRuntime(
                     workingTurns += ChatTurn("assistant", step.text.toString(), requestedCalls)
                     val toolImages = mutableListOf<ChatImage>()
                     for ((requested, recordId) in requestedRecords) {
-                        val result = executeToolCall(activeRun, trigger.text, requested, definitions, recordId)
+                        val callDefinitions = if (askedUserThisRun && requested.toolId == "ask_user") {
+                            requestDefinitions.filterNot { it.id == "ask_user" }
+                        } else {
+                            requestDefinitions
+                        }
+                        val result = executeToolCall(
+                            activeRun,
+                            trigger.text,
+                            requested,
+                            callDefinitions,
+                            recordId,
+                        )
+                        if (requested.toolId == "ask_user" && callDefinitions.any { it.id == "ask_user" }) {
+                            askedUserThisRun = true
+                        }
                         workingTurns += ChatTurn(
                             role = "tool",
                             content = result.content,
                             toolCallId = requested.id,
                             sourceToolCallId = recordId,
                         )
-                        if (definitions.firstOrNull { it.id == requested.toolId }?.resultLifetime ==
+                        if (callDefinitions.firstOrNull { it.id == requested.toolId }?.resultLifetime ==
                             ToolResultLifetime.SINGLE_MODEL_STEP) {
                             pendingSingleStepResults += recordId
                         }

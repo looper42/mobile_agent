@@ -59,7 +59,7 @@ class PrototypeApplication : Application() {
     val toolPermissions by lazy { ToolPermissionRepository(this) }
     val userQuestions by lazy { UserQuestionBroker() }
     val toolRegistry by lazy {
-        ToolCatalog.create(this, conversations, artifacts, deviceGateway, userQuestions)
+        ToolCatalog.create(this, conversations, artifacts, deviceGateway, skills, userQuestions)
     }
     val chatWorkspace by lazy { xyz.chouxuewei.mobile_agent.chat.ChatWorkspace(this) }
     val chatPresenter by lazy { xyz.chouxuewei.mobile_agent.chat.ChatPresenter(this, applicationScope) }
