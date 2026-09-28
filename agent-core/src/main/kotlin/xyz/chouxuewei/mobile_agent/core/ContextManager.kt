@@ -71,6 +71,7 @@ class ContextManager(
         manual: Boolean = false,
         onStatus: (String) -> Unit = {},
         tools: List<ToolDefinition> = emptyList(),
+        activeSkills: List<ResolvedSkill> = emptyList(),
     ): List<ChatTurn> {
         policy.validate()
         val history = store.messagesThrough(id, through).filter {
@@ -86,7 +87,8 @@ class ContextManager(
         val previous = store.snapshot(id)?.takeIf { ContextSnapshotValidator.isValid(it, history) }
         // 每轮只读取一次设置，避免任务执行中修改偏好导致同一轮工具循环前后不一致。
         val systemPrompt = currentSystemPrompt(personalizedInstructions())
-        val original = assembler.assemble(history, previous, toolHistory, systemPrompt)
+        val skillMap = activeSkills.associateBy { it.ref.versionId }
+        val original = assembler.assemble(history, previous, toolHistory, systemPrompt, skillMap, through)
         val originalEstimate = estimateRequest(original, tools)
         AgentLog.d("Context") {
             "prepare conversation=$id messages=${history.size} tools=${toolHistory.size} estimated=$originalEstimate input_budget=${policy.inputBudget} manual=$manual snapshot=${previous != null}"
@@ -100,7 +102,7 @@ class ContextManager(
         onStatus(localizedText("正在整理较早对话…", "Summarizing earlier conversation…"))
         try {
             // 保留最近两轮的完整语义单元，从用户消息开始切分，不拆开一问一答。
-            val cut = planner.cutIndex(history, toolHistory, systemPrompt, policy.inputBudget)
+            val cut = planner.cutIndex(history, toolHistory, systemPrompt, policy.inputBudget, skillMap, through)
             if (cut == 0) {
                 if (manual) onStatus(localizedText("没有需要整理的较早对话", "There is no earlier conversation to summarize."))
                 return requireFits(original, policy, tools)
@@ -114,7 +116,7 @@ class ContextManager(
                 prefix.associate { it.id to it.version }, summary, model,
                 originalEstimate, 0, System.currentTimeMillis(),
             )
-            val compacted = assembler.assemble(history, candidate, toolHistory, systemPrompt)
+            val compacted = assembler.assemble(history, candidate, toolHistory, systemPrompt, skillMap, through)
             val after = estimateRequest(compacted, tools)
             if (after >= policy.inputBudget * .6) throw ContextBudgetException(localizedText("近期对话或关键要求较长，无法整理到当前容量，请缩短输入或增加上下文长度", "Recent conversation or key requirements are too long for the current capacity. Shorten the input or increase the context length."))
             check(tail.isNotEmpty())

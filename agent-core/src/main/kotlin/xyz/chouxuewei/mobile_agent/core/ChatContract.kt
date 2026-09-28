@@ -48,6 +48,7 @@ data class Conversation(
     val attachments: List<AttachmentRef> = emptyList(),
     val reasoningEffort: String? = null,
     val pinned: Boolean = false,
+    val draftSkills: List<SkillRef> = emptyList(),
 )
 
 /** 一次模型请求形成一个展示单元，保留思考、该轮工具调用和该轮正文的真实先后关系。 */
@@ -72,6 +73,7 @@ data class Message(
     val reasoningSteps: List<String> = emptyList(),
     val reasoningDurationMillis: Long? = null,
     val assistantSteps: List<AssistantStep> = emptyList(),
+    val skills: List<SkillRef> = emptyList(),
 )
 
 /**
@@ -154,6 +156,7 @@ interface ConversationStore {
         text: String,
         attachments: List<AttachmentRef>,
         reasoningEffort: String? = null,
+        skills: List<SkillRef> = emptyList(),
     )
     suspend fun messages(id: String): List<Message>
     suspend fun messagesThrough(conversationId: String, boundary: Long): List<Message> =
@@ -163,7 +166,12 @@ interface ConversationStore {
         messages(conversationId).firstOrNull { it.status == MessageStatus.QUEUED }
     suspend fun hasQueuedMessage(conversationId: String): Boolean =
         firstQueuedMessage(conversationId) != null
-    suspend fun enqueue(id: String, text: String, attachments: List<AttachmentRef>): Message
+    suspend fun enqueue(
+        id: String,
+        text: String,
+        attachments: List<AttachmentRef>,
+        skills: List<SkillRef> = emptyList(),
+    ): Message
     suspend fun beginRun(id: String, triggerId: String, model: String): Run
     suspend fun setRunModel(run: Run, model: String)
     suspend fun updateReply(run: Run, text: String, assistantSteps: List<AssistantStep> = emptyList())

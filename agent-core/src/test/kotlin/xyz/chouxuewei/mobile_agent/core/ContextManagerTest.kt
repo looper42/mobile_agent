@@ -54,6 +54,21 @@ class ContextManagerTest {
         assertEquals(listOf("system","user"),turns.map { it.role })
         assertEquals("推荐一份午餐",turns.last().content)
     }
+    @Test fun selectedSkillIsInjectedOnlyForThePreparedRun()=runBlocking {
+        val ref=SkillRef("s1","v1","review","Review")
+        val store=MemoryConversationStore().apply {
+            add(MessageRole.USER,"检查这段内容")
+            history[0]=history[0].copy(skills=listOf(ref))
+        }
+        val manager=ContextManager(store)
+        val resolved=ResolvedSkill(ref,"Review text","逐项检查事实和风险，不要遗漏。")
+        val active=manager.prepare("c",store.history.last().sequence,policy,"test",gateway(),activeSkills=listOf(resolved))
+        assertTrue(active.last().content.contains("逐项检查事实和风险"))
+        assertTrue(active.last().content.endsWith("检查这段内容"))
+        val nextRun=manager.prepare("c",Long.MAX_VALUE,policy,"test",gateway())
+        assertFalse(nextRun.last().content.contains("逐项检查事实和风险"))
+        assertEquals("检查这段内容",nextRun.last().content)
+    }
     @Test fun compactionKeepsCorrectionsRecentMessagesAndAllOriginals()= runBlocking {
         val store=fixture(); val original=store.history.toList(); val manager=ContextManager(store)
         var requests=0

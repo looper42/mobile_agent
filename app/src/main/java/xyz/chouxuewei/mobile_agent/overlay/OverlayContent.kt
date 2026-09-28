@@ -7,6 +7,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -84,6 +85,7 @@ import xyz.chouxuewei.mobile_agent.core.ExecutionMode
 import xyz.chouxuewei.mobile_agent.core.Message
 import xyz.chouxuewei.mobile_agent.core.MessageRole
 import xyz.chouxuewei.mobile_agent.core.MessageStatus
+import xyz.chouxuewei.mobile_agent.core.SkillRef
 import xyz.chouxuewei.mobile_agent.core.ThemePreference
 import xyz.chouxuewei.mobile_agent.core.ToolApprovalRequest
 import xyz.chouxuewei.mobile_agent.core.ToolCallRecord
@@ -114,6 +116,7 @@ internal data class OverlayViewState(
     val toolCalls: List<ToolCallRecord> = emptyList(),
     val toolTitles: Map<String, String> = emptyMap(),
     val draft: ComposerDraft = ComposerDraft(),
+    val conversationSkills: List<SkillRef> = emptyList(),
     val activeConversations: Set<String> = emptySet(),
     val approvals: List<ToolApprovalRequest> = emptyList(),
     val questions: List<UserQuestionRequest> = emptyList(),
@@ -136,6 +139,7 @@ internal interface OverlayActions {
     fun openConversation()
     fun selectConversation(id: String)
     fun editDraft(draft: ComposerDraft)
+    fun removeConversationSkill(skillId: String)
     fun requestInputFocus()
     fun releaseInputFocus()
     fun sendMessage()
@@ -1254,8 +1258,36 @@ private fun OverlayComposer(state: OverlayViewState, actions: OverlayActions, mo
         color = colors.surface,
         border = BorderStroke(1.dp, colors.divider),
     ) {
-        Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
-            verticalAlignment = Alignment.Bottom) {
+        Column {
+            val visibleSkills = (state.conversationSkills.map { it to true } + state.draft.skills.map { it to false })
+                .distinctBy { it.first.skillId }
+            if (visibleSkills.isNotEmpty()) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    visibleSkills.forEach { (skill, persistent) ->
+                        Surface(
+                            Modifier.clickable {
+                                if (persistent) actions.removeConversationSkill(skill.skillId)
+                                else actions.editDraft(state.draft.copy(skills = state.draft.skills.filterNot { it.skillId == skill.skillId }))
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (persistent) colors.accentSoft else colors.surfaceRaised,
+                        ) {
+                            Text(
+                                (if (persistent) localizedText("会话 · ", "Chat · ") else "") + "/${skill.slashName} ×",
+                                Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                color = if (persistent) colors.accent else colors.text,
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    }
+                }
+            }
+            Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.Bottom) {
             BasicTextField(
                 value = state.draft.text,
                 onValueChange = { actions.editDraft(state.draft.copy(text = it)) },
@@ -1307,6 +1339,7 @@ private fun OverlayComposer(state: OverlayViewState, actions: OverlayActions, mo
             }
         }
     }
+}
 }
 
 @Composable

@@ -17,12 +17,12 @@ internal class MemoryConversationStore : ConversationStore {
     override suspend fun rename(id: String, title: String) { conversation=conversation.copy(title=title) }
     override suspend fun setPinned(id: String, pinned: Boolean) { conversation=conversation.copy(pinned=pinned) }
     override suspend fun deleteConversation(id: String) { history.clear() }
-    override suspend fun saveDraft(id: String,text: String,attachments: List<AttachmentRef>,reasoningEffort: String?) {
-        conversation=conversation.copy(draft=text,attachments=attachments,reasoningEffort=reasoningEffort)
+    override suspend fun saveDraft(id: String,text: String,attachments: List<AttachmentRef>,reasoningEffort: String?,skills: List<SkillRef>) {
+        conversation=conversation.copy(draft=text,attachments=attachments,reasoningEffort=reasoningEffort,draftSkills=skills)
     }
     override suspend fun messages(id: String) = history.toList()
-    override suspend fun enqueue(id: String,text: String,attachments: List<AttachmentRef>): Message {
-        val m=Message(UUID.randomUUID().toString(),id,(history.maxOfOrNull { it.sequence } ?: 0)+2,MessageRole.USER,text,MessageStatus.QUEUED,1,attachments)
+    override suspend fun enqueue(id: String,text: String,attachments: List<AttachmentRef>,skills: List<SkillRef>): Message {
+        val m=Message(UUID.randomUUID().toString(),id,(history.maxOfOrNull { it.sequence } ?: 0)+2,MessageRole.USER,text,MessageStatus.QUEUED,1,attachments,skills=skills)
         history.add(m); return m
     }
     override suspend fun beginRun(id: String,triggerId: String,model: String): Run {

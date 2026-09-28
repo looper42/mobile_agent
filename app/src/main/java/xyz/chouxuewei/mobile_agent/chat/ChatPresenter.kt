@@ -21,6 +21,9 @@ import xyz.chouxuewei.mobile_agent.core.ToolApprovalRequest
 import xyz.chouxuewei.mobile_agent.core.ToolCallRecord
 import xyz.chouxuewei.mobile_agent.core.UserQuestionRequest
 import xyz.chouxuewei.mobile_agent.core.withStreamingReply
+import xyz.chouxuewei.mobile_agent.core.SkillRef
+import xyz.chouxuewei.mobile_agent.core.SkillSummary
+import xyz.chouxuewei.mobile_agent.core.SkillUsagePreferences
 import xyz.chouxuewei.mobile_agent.data.ModelSettings
 import xyz.chouxuewei.mobile_agent.data.ModelUsageSummary
 import xyz.chouxuewei.mobile_agent.data.SpeechSettings
@@ -38,6 +41,7 @@ data class ChatSessionUiState(
     val questions: Map<String, UserQuestionRequest> = emptyMap(),
     val incomingShares: List<IncomingShare> = emptyList(),
     val error: String? = null,
+    val conversationSkills: List<SkillRef> = emptyList(),
 )
 
 data class ChatEnvironmentUiState(
@@ -50,6 +54,8 @@ data class ChatEnvironmentUiState(
     val speechSettings: SpeechSettings = SpeechSettings(),
     val voiceInputState: VoiceInputState = VoiceInputState.Idle,
     val requestedSettingsPage: String? = null,
+    val skills: List<SkillSummary> = emptyList(),
+    val skillPreferences: SkillUsagePreferences = SkillUsagePreferences(),
 )
 
 data class ConversationTimelineState(
@@ -93,6 +99,9 @@ class ChatPresenter(app: PrototypeApplication, scope: CoroutineScope) {
         .merge(app.userQuestions.requests) { state, value -> state.copy(questions = value) }
         .merge(app.attachments.incoming) { state, value -> state.copy(incomingShares = value) }
         .merge(workspace.error) { state, value -> state.copy(error = value) }
+        .merge(workspace.current.flatMapLatest { conversationId ->
+            if (conversationId == null) flowOf(emptyList()) else app.skills.observeConversationSkills(conversationId)
+        }) { state, value -> state.copy(conversationSkills = value) }
         .stateIn(scope, started, ChatSessionUiState())
 
     val environment = combine(
@@ -113,6 +122,8 @@ class ChatPresenter(app: PrototypeApplication, scope: CoroutineScope) {
         .merge(app.speechSettings.settings) { state, value -> state.copy(speechSettings = value) }
         .merge(app.voiceInput.state) { state, value -> state.copy(voiceInputState = value) }
         .merge(app.requestedSettingsPage) { state, value -> state.copy(requestedSettingsPage = value) }
+        .merge(app.skills.summaries) { state, value -> state.copy(skills = value) }
+        .merge(app.skills.preferences) { state, value -> state.copy(skillPreferences = value) }
         .stateIn(scope, started, ChatEnvironmentUiState())
 
     val timeline = workspace.current.flatMapLatest { conversationId ->

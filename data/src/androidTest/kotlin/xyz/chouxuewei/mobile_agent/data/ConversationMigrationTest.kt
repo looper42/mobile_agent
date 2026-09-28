@@ -35,6 +35,7 @@ class ConversationMigrationTest {
                 CONVERSATION_PIN_MIGRATION,
                 MESSAGE_SEARCH_MIGRATION,
                 REMOVE_LEGACY_AGENT_MIGRATION,
+                SKILLS_MIGRATION,
             ).build()
         var db=open()
         try {
@@ -60,6 +61,7 @@ class ConversationMigrationTest {
             db.close(); db=open(); store=RoomConversationStore(db)
             assertTrue(store.conversation(c.id)!!.pinned)
             assertEquals("未发送草稿",store.conversation(c.id)!!.draft)
+            assertTrue(store.conversation(c.id)!!.draftSkills.isEmpty())
             assertEquals(listOf(attachment),store.conversation(c.id)!!.attachments)
             assertEquals(snap,store.snapshot(c.id))
             assertEquals("部分回复中文",store.messages(c.id).first { it.id==secondRun.replyMessageId }.text)

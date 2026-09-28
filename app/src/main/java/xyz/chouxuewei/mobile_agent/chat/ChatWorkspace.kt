@@ -12,6 +12,7 @@ import xyz.chouxuewei.mobile_agent.attachments.IncomingShare
 data class ComposerDraft(
     val text: String = "",
     val attachments: List<AttachmentRef> = emptyList(),
+    val skills: List<SkillRef> = emptyList(),
 )
 
 /** UI 状态独立于配色和 Activity；有序写入避免慢磁盘把旧草稿覆盖回去。 */
@@ -28,6 +29,7 @@ class ChatWorkspace(private val app: PrototypeApplication) {
                 pending.draft.text,
                 pending.draft.attachments,
                 null,
+                pending.draft.skills,
             )
             app.attachments.release(pending.draft.attachments)
             if (pending.cleanupAttachments) app.attachments.cleanup()
@@ -51,7 +53,8 @@ class ChatWorkspace(private val app: PrototypeApplication) {
             app.chatRuntime.ready()
             app.modelSettings.seedDebugDefaults()
             val remembered = app.appearance.currentConversation.first()?.let { app.conversations.conversation(it) }
-            val conversation = remembered ?: app.conversations.observeConversations().first().firstOrNull() ?: app.conversations.createConversation()
+            val conversation = remembered ?: app.conversations.observeConversations().first().firstOrNull()
+                ?: createConversationWithDefaults()
             app.modelSettings.migrateLegacyReasoningEffort(conversation.reasoningEffort)
             activate(conversation)
         }
@@ -65,14 +68,20 @@ class ChatWorkspace(private val app: PrototypeApplication) {
         current.value?.takeIf { it != c.id }?.let { draftPersistence.flush(it) }
         if (drafts.value[c.id] == null) {
             drafts.update {
-                it + (c.id to ComposerDraft(c.draft, c.attachments))
+                it + (c.id to ComposerDraft(c.draft, c.attachments, c.draftSkills))
             }
         }
         current.value = c.id
         app.appearance.setCurrentConversation(c.id)
     }
     fun select(id: String) = dispatch { app.conversations.conversation(id)?.let { activate(it) } }
-    fun newConversation() = dispatch { activate(app.conversations.createConversation()) }
+    fun newConversation() = dispatch { activate(createConversationWithDefaults()) }
+
+    private suspend fun createConversationWithDefaults(): Conversation {
+        val conversation = app.conversations.createConversation()
+        app.skills.applyDefaults(conversation.id)
+        return conversation
+    }
     fun edit(id: String, draft: ComposerDraft) {
         val previousAttachments = drafts.value[id]?.attachments.orEmpty().map(AttachmentRef::uri).toSet()
         drafts.update { it + (id to draft) }
@@ -97,7 +106,16 @@ class ChatWorkspace(private val app: PrototypeApplication) {
                 // Save the visible version, then remove the writer before enqueue clears the draft.
                 // This prevents a delayed draft write from resurrecting already-sent text.
                 draftPersistence.flushAndRemove(id)
-                app.chatRuntime.send(id, draft.text, draft.attachments, reasoningEffort, modelProfileId)
+                val activeSkills = (app.skills.conversationSkills(id) + draft.skills)
+                    .distinctBy(SkillRef::skillId)
+                app.chatRuntime.send(
+                    id,
+                    draft.text,
+                    draft.attachments,
+                    reasoningEffort,
+                    modelProfileId,
+                    activeSkills,
+                )
                 app.attachments.cleanup()
             }
             catch (e: Exception) {
@@ -124,16 +142,19 @@ class ChatWorkspace(private val app: PrototypeApplication) {
         dispatch {
             // 只在转写成功后创建会话；发送失败时保留文字草稿，避免语音内容丢失。
             val conversation = app.conversations.createConversation()
+            app.skills.applyDefaults(conversation.id)
             activate(conversation)
             val pendingDraft = ComposerDraft(text = normalized)
             drafts.update { it + (conversation.id to pendingDraft) }
-            app.conversations.saveDraft(conversation.id, normalized, emptyList(), null)
+            app.conversations.saveDraft(conversation.id, normalized, emptyList(), null, emptyList())
+            val activeSkills = app.skills.conversationSkills(conversation.id)
             app.chatRuntime.send(
                 conversation.id,
                 normalized,
                 emptyList(),
                 reasoningEffort,
                 modelProfileId,
+                activeSkills,
             )
             drafts.update { it + (conversation.id to ComposerDraft()) }
         }
@@ -143,17 +164,18 @@ class ChatWorkspace(private val app: PrototypeApplication) {
         dispatch {
             try {
                 val conversation = if (targetId == null) {
-                    app.conversations.createConversation()
+                    createConversationWithDefaults()
                 } else {
                     app.conversations.conversation(targetId) ?: error(localizedText("找不到目标对话，请重新选择", "The target conversation was not found. Please choose again."))
                 }
                 val existing = drafts.value[conversation.id]
-                    ?: ComposerDraft(conversation.draft, conversation.attachments)
+                    ?: ComposerDraft(conversation.draft, conversation.attachments, conversation.draftSkills)
                 val mergedText = listOf(existing.text.trim(), share.text.trim())
                     .filter(String::isNotBlank).joinToString("\n")
                 val merged = ComposerDraft(
                     text = mergedText,
                     attachments = (existing.attachments + share.attachments).distinctBy(AttachmentRef::uri),
+                    skills = existing.skills,
                 )
                 drafts.update { it + (conversation.id to merged) }
                 draftPersistence.submit(
@@ -174,6 +196,24 @@ class ChatWorkspace(private val app: PrototypeApplication) {
         if (app.attachments.dismiss(share.id) == null) return
         app.applicationScope.launch { app.attachments.cleanup() }
     }
+    fun addSkillOnce(id: String, skill: SkillRef) {
+        dispatch {
+            val draft = drafts.value[id] ?: ComposerDraft()
+            val activeIds = (app.skills.conversationSkills(id) + draft.skills)
+                .mapTo(linkedSetOf(), SkillRef::skillId)
+            if (skill.skillId in activeIds) return@dispatch
+            require(activeIds.size < SkillLimits.MAX_SELECTED) {
+                localizedText("一次最多使用 ${SkillLimits.MAX_SELECTED} 个技能", "Use at most ${SkillLimits.MAX_SELECTED} Skills at a time.")
+            }
+            edit(id, draft.copy(skills = draft.skills + skill))
+        }
+    }
+    fun removeSkillOnce(id: String, skillId: String) {
+        val draft = drafts.value[id] ?: return
+        edit(id, draft.copy(skills = draft.skills.filterNot { it.skillId == skillId }))
+    }
+    fun bindSkill(id: String, skill: SkillRef) = dispatch { app.skills.bindConversation(id, skill) }
+    fun unbindSkill(id: String, skillId: String) = dispatch { app.skills.unbindConversation(id, skillId) }
     fun stop(id: String) { app.applicationScope.launch { app.chatRuntime.stop(id) } }
     fun compact(id: String) { app.applicationScope.launch { app.chatRuntime.compact(id) } }
     fun flushDrafts() { app.applicationScope.launch { draftPersistence.flushAll() } }
@@ -187,7 +227,7 @@ class ChatWorkspace(private val app: PrototypeApplication) {
         drafts.update { it - id }
         if (deletingCurrent) {
             val replacement = app.conversations.observeConversations().first().firstOrNull()
-                ?: app.conversations.createConversation()
+                ?: createConversationWithDefaults()
             activate(replacement)
         }
         // 删除记录已完成；没有其他运行时再立即回收失去引用的附件和产物文件。

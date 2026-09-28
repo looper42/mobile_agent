@@ -66,6 +66,7 @@ class ChatRuntime(
     private val usageRecorder: suspend (ModelUsageRecord) -> Unit = {},
     private val personalizedInstructions: suspend () -> String = { "" },
     private val maxStepsPerRun: suspend () -> Int = { DEFAULT_SINGLE_RUN_MAX_STEPS },
+    private val skillResolver: SkillInstructionResolver? = null,
 ) {
     private val gate = Mutex()
     private val conversationGates = ConcurrentHashMap<String, Mutex>()
@@ -98,13 +99,17 @@ class ChatRuntime(
         attachments: List<AttachmentRef>,
         reasoningEffort: String? = null,
         modelProfileId: String? = null,
+        skills: List<SkillRef> = emptyList(),
     ) {
         require(text.isNotBlank() || attachments.any(AttachmentRef::isImage)) {
             localizedText("请输入文字说明你想如何处理附件", "Describe how you want to handle the attachment.")
         }
         recovery.await()
         conversationGates.computeIfAbsent(id) { Mutex() }.withLock {
-            val trigger = store.enqueue(id, text.trim(), attachments)
+            require(skills.size <= SkillLimits.MAX_SELECTED) {
+                localizedText("一次最多使用 ${SkillLimits.MAX_SELECTED} 个 Skill", "Use at most ${SkillLimits.MAX_SELECTED} Skills at a time.")
+            }
+            val trigger = store.enqueue(id, text.trim(), attachments, skills.distinctBy(SkillRef::skillId))
             gate.withLock {
                 // 队列中的消息绑定发送时的模型与思考强度，随后切换只影响新消息。
                 preferencesByTrigger[trigger.id] = RequestPreferences(reasoningEffort, modelProfileId)
@@ -221,6 +226,7 @@ class ChatRuntime(
                     store.updateReply(activeRun, snapshot.text, snapshot.assistantSteps)
                 }
                 val definitions = enabledDefinitions()
+                val resolvedSkills = skillResolver?.resolveSkills(trigger.skills).orEmpty()
                 // 每轮开始时只读取一次，避免用户在执行中修改设置导致当前任务的上限突然变化。
                 val maxSteps = requireValidSingleRunMaxSteps(maxStepsPerRun())
                 val hasStepLimit = maxSteps != UNLIMITED_SINGLE_RUN_MAX_STEPS
@@ -229,7 +235,7 @@ class ChatRuntime(
                 }
                 val workingTurns = resolveImages(context.prepare(
                     id, trigger.sequence, c.policy, c.model, c.gateway,
-                    onStatus = { notice(id, it) }, tools = definitions,
+                    onStatus = { notice(id, it) }, tools = definitions, activeSkills = resolvedSkills,
                 )).toMutableList()
                 workingTurnsForCleanup = workingTurns
                 val activeBaseTurnCount = workingTurns.size

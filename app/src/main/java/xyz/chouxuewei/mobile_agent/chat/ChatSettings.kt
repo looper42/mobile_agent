@@ -106,6 +106,7 @@ import xyz.chouxuewei.mobile_agent.prototype.PrototypeApplication
 import xyz.chouxuewei.mobile_agent.ui.theme.LocalChatColors
 import xyz.chouxuewei.mobile_agent.update.AppUpdateState
 import xyz.chouxuewei.mobile_agent.update.ReleaseInfo
+import xyz.chouxuewei.mobile_agent.skills.SkillSettingsPage
 
 private data class SettingsTab(val id: String, val label: String, val icon: Int)
 private data class SettingsNotice(val message: String, val success: Boolean)
@@ -203,7 +204,7 @@ fun ChatSettings(
     var page by rememberSaveable {
         mutableStateOf(
             initialPage.takeIf {
-                it in setOf("general", "personalization", "model", "voice", "data", "about")
+                it in setOf("general", "personalization", "skills", "model", "voice", "data", "about")
             } ?: "general",
         )
     }
@@ -260,6 +261,7 @@ fun ChatSettings(
     val tabs = listOf(
         SettingsTab("general", localizedText("通用", "General"), R.drawable.lucide_settings),
         SettingsTab("personalization", localizedText("个性化", "Personalization"), R.drawable.lucide_sparkles),
+        SettingsTab("skills", localizedText("技能", "Skills"), R.drawable.lucide_brain_circuit),
         SettingsTab("voice", localizedText("语音", "Voice"), R.drawable.lucide_mic),
         SettingsTab("model", localizedText("模型服务", "Model service"), R.drawable.lucide_bot),
         SettingsTab("data", localizedText("数据管理", "Data"), R.drawable.lucide_database),
@@ -426,6 +428,8 @@ fun ChatSettings(
                         }
                     },
                 )
+
+                "skills" -> SkillSettingsPage(app)
 
                 "voice" -> SpeechSettingsPage(
                     settings = speechSettings,
@@ -2213,7 +2217,7 @@ private fun AppUpdateContent(
         }
         Text(
             localizedText(
-                "更新来自项目的 GitHub Release，请确保手机网能正常访问GitHub。",
+                "更新来自项目的 GitHub Release，请确保手机网络能正常访问GitHub。",
                 "Updates come from this project's GitHub Releases. Please make sure that the mobile network can access GitHub normally.",
             ),
             style = MaterialTheme.typography.labelSmall,

@@ -19,6 +19,7 @@ internal object DatabaseProvider {
                 CONVERSATION_PIN_MIGRATION,
                 MESSAGE_SEARCH_MIGRATION,
                 REMOVE_LEGACY_AGENT_MIGRATION,
+                SKILLS_MIGRATION,
             )
             .addCallback(object : RoomDatabase.Callback() {
                 override fun onCreate(db: SupportSQLiteDatabase) {
@@ -112,6 +113,64 @@ val REMOVE_LEGACY_AGENT_MIGRATION = object : Migration(8, 9) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL("DROP TABLE IF EXISTS steps")
         db.execSQL("DROP TABLE IF EXISTS tasks")
+    }
+}
+
+/** Adds versioned, user-owned Skills without rewriting existing messages or drafts. */
+val SKILLS_MIGRATION = object : Migration(9, 10) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE conversations ADD COLUMN draftSkills TEXT NOT NULL DEFAULT '[]'")
+        db.execSQL("ALTER TABLE messages ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'")
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS skills (
+              id TEXT NOT NULL PRIMARY KEY,
+              slashName TEXT NOT NULL,
+              displayName TEXT NOT NULL,
+              description TEXT NOT NULL,
+              activeVersionId TEXT NOT NULL,
+              enabled INTEGER NOT NULL,
+              source TEXT NOT NULL,
+              createdAt INTEGER NOT NULL,
+              updatedAt INTEGER NOT NULL,
+              deletedAt INTEGER
+            )
+            """.trimIndent(),
+        )
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_skills_slashName ON skills(slashName)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_skills_updatedAt ON skills(updatedAt)")
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS skill_versions (
+              id TEXT NOT NULL PRIMARY KEY,
+              skillId TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              description TEXT NOT NULL,
+              instructions TEXT NOT NULL,
+              manifestJson TEXT NOT NULL,
+              contentHash TEXT NOT NULL,
+              createdAt INTEGER NOT NULL,
+              FOREIGN KEY(skillId) REFERENCES skills(id) ON DELETE CASCADE
+            )
+            """.trimIndent(),
+        )
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_skill_versions_skillId_version ON skill_versions(skillId,version)")
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS conversation_skills (
+              conversationId TEXT NOT NULL,
+              skillId TEXT NOT NULL,
+              versionId TEXT NOT NULL,
+              boundAt INTEGER NOT NULL,
+              PRIMARY KEY(conversationId,skillId),
+              FOREIGN KEY(conversationId) REFERENCES conversations(id) ON DELETE CASCADE,
+              FOREIGN KEY(skillId) REFERENCES skills(id) ON DELETE CASCADE,
+              FOREIGN KEY(versionId) REFERENCES skill_versions(id) ON DELETE RESTRICT
+            )
+            """.trimIndent(),
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_conversation_skills_versionId ON conversation_skills(versionId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_conversation_skills_skillId ON conversation_skills(skillId)")
     }
 }
 

@@ -159,6 +159,41 @@ class ChatRuntimeTest {
             assertEquals(RunStatus.SUCCEEDED,store.runs.single().status)
         } finally { scope.cancel() }
     }
+
+    @Test fun selectedSkillIsResolvedAndInjectedOnlyForItsTriggeredRun()=runBlocking {
+        val store=MemoryConversationStore()
+        val scope=CoroutineScope(SupervisorJob()+Dispatchers.Unconfined)
+        val requests=mutableListOf<ChatRequest>()
+        val skill=SkillRef("skill-1","version-1","review","Review")
+        val gateway=ChatModelGateway { request -> flow {
+            requests += request
+            emit(ModelEvent.TextDelta("完成"))
+            emit(ModelEvent.Completed("stop"))
+        } }
+        val resolver=object : SkillInstructionResolver {
+            override suspend fun resolveSkills(refs: List<SkillRef>) = refs.map {
+                assertEquals(skill,it)
+                ResolvedSkill(it,"Review code","SKILL-ONLY-MARKER")
+            }
+        }
+        val runtime=ChatRuntime(
+            store=store,
+            connection={ _ -> ChatConnection(gateway,ContextPolicy(16000,1024),"test") },
+            scope=scope,
+            skillResolver=resolver,
+        )
+        try {
+            runtime.send("c","第一条",emptyList(),skills=listOf(skill))
+            withTimeout(3000) { while(runtime.active.value.isNotEmpty()) yield() }
+            runtime.send("c","第二条",emptyList())
+            withTimeout(3000) { while(runtime.active.value.isNotEmpty()) yield() }
+
+            assertEquals(2,requests.size)
+            assertTrue(requests.first().messages.single { it.role=="user" }.content.contains("SKILL-ONLY-MARKER"))
+            assertFalse(requests.last().messages.any { it.content.contains("SKILL-ONLY-MARKER") })
+            assertEquals(listOf(skill),store.history.first { it.role==MessageRole.USER }.skills)
+        } finally { scope.cancel() }
+    }
 }
 
 private fun countingLoopToolProvider(onExecute: () -> Unit)=object : ToolProvider {

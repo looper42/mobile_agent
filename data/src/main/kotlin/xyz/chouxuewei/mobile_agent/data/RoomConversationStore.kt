@@ -34,7 +34,8 @@ class RoomConversationStore internal constructor(private val database: AgentData
         text: String,
         attachments: List<AttachmentRef>,
         reasoningEffort: String?,
-    ) = dao.draft(id, text, encodeAttachments(attachments), reasoningEffort)
+        skills: List<SkillRef>,
+    ) = dao.draft(id, text, encodeAttachments(attachments), reasoningEffort, encodeSkillRefs(skills))
     override suspend fun messages(id: String) = dao.messages(id).map(MessageEntity::record)
     override suspend fun messagesThrough(conversationId: String, boundary: Long) =
         dao.messagesThrough(conversationId, boundary).map(MessageEntity::record)
@@ -42,17 +43,22 @@ class RoomConversationStore internal constructor(private val database: AgentData
     override suspend fun firstQueuedMessage(conversationId: String) = dao.firstQueuedMessage(conversationId)?.record()
     override suspend fun hasQueuedMessage(conversationId: String) = dao.hasQueuedMessage(conversationId)
 
-    override suspend fun enqueue(id: String, text: String, attachments: List<AttachmentRef>): Message = database.withTransaction {
+    override suspend fun enqueue(
+        id: String,
+        text: String,
+        attachments: List<AttachmentRef>,
+        skills: List<SkillRef>,
+    ): Message = database.withTransaction {
         val c = requireNotNull(dao.conversation(id))
         val lastSequence = dao.maxSequence(id)
         // 为回复预留相邻序号，即使多个补充已排队，回复仍位于对应用户消息之后。
         val m = Message(UUID.randomUUID().toString(), id, (lastSequence ?: 0) + 2,
-            MessageRole.USER, text, MessageStatus.QUEUED, System.currentTimeMillis(), attachments)
+            MessageRole.USER, text, MessageStatus.QUEUED, System.currentTimeMillis(), attachments, skills = skills)
         dao.save(m.entity())
         val firstTitle = text.take(28).ifBlank { if (attachments.any(AttachmentRef::isImage)) localizedText("图片对话", "Image conversation") else localizedText("新对话", "New conversation") }
         // 标题可能是在另一种系统语言下创建的，判断占位标题时同时兼容中英文旧数据。
         dao.save(c.copy(title = if (lastSequence == null && c.title in setOf("新对话", "New conversation")) firstTitle else c.title,
-            draft = "", attachments = "[]", reasoningEffort = null, updatedAt = m.createdAt))
+            draft = "", attachments = "[]", reasoningEffort = null, updatedAt = m.createdAt, draftSkills = "[]"))
         m
     }
     override suspend fun beginRun(id: String, triggerId: String, model: String): Run = database.withTransaction {
@@ -170,6 +176,27 @@ internal fun decodeAttachments(json: String): List<AttachmentRef> = Json.parseTo
         o["sizeBytes"]?.jsonPrimitive?.longOrNull,
     )
 }
+internal fun encodeSkillRefs(values: List<SkillRef>): String = buildJsonArray {
+    values.distinctBy(SkillRef::skillId).forEach { ref ->
+        add(buildJsonObject {
+            put("skillId", ref.skillId)
+            put("versionId", ref.versionId)
+            put("slashName", ref.slashName)
+            put("displayName", ref.displayName)
+        })
+    }
+}.toString()
+internal fun decodeSkillRefs(json: String): List<SkillRef> = runCatching {
+    Json.parseToJsonElement(json).jsonArray.map { element ->
+        val value = element.jsonObject
+        SkillRef(
+            value.getValue("skillId").jsonPrimitive.content,
+            value.getValue("versionId").jsonPrimitive.content,
+            value.getValue("slashName").jsonPrimitive.content,
+            value.getValue("displayName").jsonPrimitive.content,
+        )
+    }
+}.getOrDefault(emptyList())
 private fun decodeAttachmentsSafely(json: String): List<AttachmentRef> =
     runCatching { decodeAttachments(json) }.getOrDefault(emptyList())
 /** 复用现有 reasoning 列保存步骤数组；旧版本的纯文本自动作为一个步骤读取。 */
@@ -213,9 +240,11 @@ internal fun decodeAssistantSteps(value: String): List<AssistantStep> {
 private const val ASSISTANT_STEPS_PREFIX = "assistant-steps:v2:"
 private fun ConversationEntity.record() = Conversation(
     id, title, createdAt, updatedAt, draft, decodeAttachments(attachments), reasoningEffort, pinned,
+    decodeSkillRefs(draftSkills),
 )
 private fun Conversation.entity() = ConversationEntity(
     id, title, createdAt, updatedAt, draft, encodeAttachments(attachments), reasoningEffort, pinned,
+    encodeSkillRefs(draftSkills),
 )
 private fun MessageEntity.record(): Message {
     val hasAssistantSteps = reasoning.startsWith(ASSISTANT_STEPS_PREFIX)
@@ -227,6 +256,7 @@ private fun MessageEntity.record(): Message {
         else decodeReasoningSteps(reasoning),
         reasoningDurationMillis,
         steps,
+        decodeSkillRefs(skills),
     )
 }
 private fun Message.entity() = MessageEntity(
@@ -234,6 +264,7 @@ private fun Message.entity() = MessageEntity(
     encodeAttachments(attachments), version, error,
     if (assistantSteps.isEmpty()) encodeReasoningSteps(reasoningSteps) else encodeAssistantSteps(assistantSteps),
     reasoningDurationMillis,
+    encodeSkillRefs(skills),
 )
 private fun Run.entity() = RunEntity(id, conversationId, triggerMessageId, replyMessageId, status.name, model, startedAt, finishedAt, error)
 private fun SnapshotEntity.record() = ContextSnapshot(id, conversationId, boundary, Json.parseToJsonElement(sourceVersions).jsonObject.mapValues { it.value.jsonPrimitive.long }, summary, model, inputTokensBefore, inputTokensAfter, createdAt, formatVersion)

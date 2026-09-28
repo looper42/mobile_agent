@@ -17,6 +17,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -103,6 +104,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
@@ -138,6 +141,10 @@ import xyz.chouxuewei.mobile_agent.core.UserQuestionRequest
 import xyz.chouxuewei.mobile_agent.core.userFacingMessage
 import xyz.chouxuewei.mobile_agent.core.localizedText
 import xyz.chouxuewei.mobile_agent.core.withStreamingReply
+import xyz.chouxuewei.mobile_agent.core.SkillActivationScope
+import xyz.chouxuewei.mobile_agent.core.SkillLimits
+import xyz.chouxuewei.mobile_agent.core.SkillRef
+import xyz.chouxuewei.mobile_agent.core.SkillSummary
 import xyz.chouxuewei.mobile_agent.data.ModelSettings
 import xyz.chouxuewei.mobile_agent.data.ModelProfile
 import xyz.chouxuewei.mobile_agent.data.REASONING_EFFORT_OFF
@@ -480,6 +487,9 @@ fun ChatApp(app: PrototypeApplication) {
                         selectedReasoningEffort = selectedModel?.selectedReasoningEffort,
                         contextUsage = id?.let { contextUsages[it] }
                             ?.takeIf { it.modelProfileId == null || it.modelProfileId == selectedModel?.id },
+                        skills = environment.skills,
+                        conversationSkills = session.conversationSkills,
+                        skillScope = environment.skillPreferences.defaultScope,
                         onChange = { if (id != null) workspace.edit(id, it) },
                         onModelSelect = { modelId ->
                             scope.launch {
@@ -504,6 +514,11 @@ fun ChatApp(app: PrototypeApplication) {
                         onAttach = { attachmentTarget = id; picker.launch(arrayOf("*/*")) },
                         onTools = { panel = "tools" },
                         onModel = { settingsPage = "model" },
+                        onSkills = { settingsPage = "skills" },
+                        onSkillOnce = { skill -> if (id != null) workspace.addSkillOnce(id, skill) },
+                        onSkillConversation = { skill -> if (id != null) workspace.bindSkill(id, skill) },
+                        onRemoveSkillOnce = { skillId -> if (id != null) workspace.removeSkillOnce(id, skillId) },
+                        onRemoveConversationSkill = { skillId -> if (id != null) workspace.unbindSkill(id, skillId) },
                         voiceMode = voiceMode,
                         voiceInputState = voiceInputState,
                         onVoiceModeChange = { enabled ->
@@ -1197,6 +1212,23 @@ private fun MessageRow(
                 modifier = Modifier.fillMaxWidth(.86f),
             ) {
                 Column(Modifier.padding(horizontal = 15.dp, vertical = 12.dp)) {
+                    if (message.skills.isNotEmpty()) {
+                        Row(
+                            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(bottom = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            message.skills.forEach { skill ->
+                                Surface(shape = RoundedCornerShape(10.dp), color = colors.accentSoft) {
+                                    Text(
+                                        "/${skill.slashName}",
+                                        Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        color = colors.accent,
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
+                                }
+                            }
+                        }
+                    }
                     // 与 AI 正文和思考内容保持一致：长按进入系统原生选区，可复制整段或局部文字。
                     SelectionContainer {
                         Text(message.text, style = MaterialTheme.typography.bodyLarge)
@@ -1916,6 +1948,9 @@ private fun ChatComposer(
     reasoningEfforts: List<String>,
     selectedReasoningEffort: String?,
     contextUsage: ContextUsage?,
+    skills: List<SkillSummary>,
+    conversationSkills: List<SkillRef>,
+    skillScope: SkillActivationScope,
     onChange: (ComposerDraft) -> Unit,
     onModelSelect: (String) -> Unit,
     onReasoningSelect: (String?) -> Unit,
@@ -1924,6 +1959,11 @@ private fun ChatComposer(
     onAttach: () -> Unit,
     onTools: () -> Unit,
     onModel: () -> Unit,
+    onSkills: () -> Unit,
+    onSkillOnce: (SkillRef) -> Unit,
+    onSkillConversation: (SkillRef) -> Unit,
+    onRemoveSkillOnce: (String) -> Unit,
+    onRemoveConversationSkill: (String) -> Unit,
     voiceMode: Boolean,
     voiceInputState: VoiceInputState,
     onVoiceModeChange: (Boolean) -> Unit,
@@ -1937,10 +1977,47 @@ private fun ChatComposer(
     val shape = RoundedCornerShape(28.dp)
     var modelMenu by remember { mutableStateOf(false) }
     var contextMenu by remember { mutableStateOf(false) }
+    var inputValue by remember { mutableStateOf(TextFieldValue(draft.text, TextRange(draft.text.length))) }
+    var pendingScopeSkill by remember { mutableStateOf<SkillRef?>(null) }
+    var dismissedSlashText by remember { mutableStateOf<String?>(null) }
     val currentVoiceStart by rememberUpdatedState(onVoiceStart)
     val currentVoiceFinish by rememberUpdatedState(onVoiceFinish)
     val currentVoiceCancel by rememberUpdatedState(onVoiceCancel)
     val selectedModel = models.firstOrNull { it.id == selectedModelId } ?: models.firstOrNull()
+    LaunchedEffect(draft.text) {
+        if (inputValue.text != draft.text) {
+            inputValue = TextFieldValue(draft.text, TextRange(draft.text.length))
+        }
+    }
+    val slashMatch = remember(inputValue, voiceMode) {
+        if (voiceMode) null else findSlashMatch(inputValue)
+    }
+    val selectedSkillIds = remember(draft.skills, conversationSkills) {
+        (draft.skills + conversationSkills).mapTo(linkedSetOf(), SkillRef::skillId)
+    }
+    val skillCandidates = remember(skills, selectedSkillIds, slashMatch) {
+        val query = slashMatch?.query.orEmpty()
+        if (selectedSkillIds.size >= SkillLimits.MAX_SELECTED) emptyList() else {
+            skills.asSequence()
+                .filter { it.enabled && it.id !in selectedSkillIds }
+                .filter { query.isEmpty() || it.slashName.startsWith(query) || it.displayName.contains(query, ignoreCase = true) }
+                .take(8)
+                .toList()
+        }
+    }
+    fun selectSkill(summary: SkillSummary) {
+        val match = slashMatch ?: return
+        val updated = inputValue.text.removeRange(match.start, match.end)
+        dismissedSlashText = null
+        inputValue = TextFieldValue(updated, TextRange(match.start.coerceAtMost(updated.length)))
+        onChange(draft.copy(text = updated))
+        val ref = SkillRef(summary.id, summary.activeVersionId, summary.slashName, summary.displayName)
+        when (skillScope) {
+            SkillActivationScope.ONCE -> onSkillOnce(ref)
+            SkillActivationScope.CONVERSATION -> onSkillConversation(ref)
+            SkillActivationScope.ASK -> pendingScopeSkill = ref
+        }
+    }
     Surface(
         modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 12.dp)
             .shadow(16.dp, shape, ambientColor = colors.text.copy(alpha = .07f),
@@ -1955,6 +2032,22 @@ private fun ChatComposer(
                     draft.attachments.forEach { attachment ->
                         AttachmentCard(attachment) {
                             onChange(draft.copy(attachments = draft.attachments.filterNot { it.uri == attachment.uri }))
+                        }
+                    }
+                }
+            }
+            val visibleSkills = (conversationSkills.map { it to true } + draft.skills.map { it to false })
+                .distinctBy { it.first.skillId }
+            if (visibleSkills.isNotEmpty()) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 4.dp, vertical = 3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    visibleSkills.forEach { (skill, persistent) ->
+                        ComposerSkillChip(skill, persistent) {
+                            if (persistent) onRemoveConversationSkill(skill.skillId)
+                            else onRemoveSkillOnce(skill.skillId)
                         }
                     }
                 }
@@ -2020,25 +2113,63 @@ private fun ChatComposer(
                     }
                 }
             } else {
-                BasicTextField(
-                    value = draft.text,
-                    onValueChange = { onChange(draft.copy(text = it)) },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp, max = 160.dp)
-                        .padding(horizontal = 10.dp, vertical = 10.dp).testTag("composer"),
-                    enabled = enabled,
-                    maxLines = 6,
-                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = colors.text),
-                    cursorBrush = SolidColor(colors.accent),
-                    decorationBox = { inner ->
-                        Box {
-                            if (draft.text.isEmpty()) {
-                                Text(localizedText("发消息，或描述你想完成的事", "Message Mobile Agent or describe what you want done"), color = colors.tertiary,
-                                    style = MaterialTheme.typography.bodyLarge)
+                Box {
+                    BasicTextField(
+                        value = inputValue,
+                        onValueChange = { value ->
+                            inputValue = value
+                            dismissedSlashText = null
+                            onChange(draft.copy(text = value.text))
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp, max = 160.dp)
+                            .padding(horizontal = 10.dp, vertical = 10.dp).testTag("composer"),
+                        enabled = enabled,
+                        maxLines = 6,
+                        textStyle = MaterialTheme.typography.bodyLarge.copy(color = colors.text),
+                        cursorBrush = SolidColor(colors.accent),
+                        decorationBox = { inner ->
+                            Box {
+                                if (inputValue.text.isEmpty()) {
+                                    Text(localizedText("发消息，输入 / 可引用技能", "Message Mobile Agent, or type / to use a Skill"), color = colors.tertiary,
+                                        style = MaterialTheme.typography.bodyLarge)
+                                }
+                                inner()
                             }
-                            inner()
+                        },
+                    )
+                    DropdownMenu(
+                        expanded = slashMatch != null && dismissedSlashText != inputValue.text,
+                        onDismissRequest = { dismissedSlashText = inputValue.text },
+                        containerColor = colors.surface,
+                        shape = RoundedCornerShape(16.dp),
+                    ) {
+                        skillCandidates.forEach { skill ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column(Modifier.widthIn(min = 240.dp, max = 320.dp)) {
+                                        Text("/${skill.slashName}", fontWeight = FontWeight.SemiBold)
+                                        Text(skill.description, color = colors.secondary, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    }
+                                },
+                                onClick = { selectSkill(skill) },
+                            )
                         }
-                    },
-                )
+                        if (skillCandidates.isEmpty()) {
+                            DropdownMenuItem(
+                                text = { Text(when {
+                                    selectedSkillIds.size >= SkillLimits.MAX_SELECTED -> localizedText("已达到 ${SkillLimits.MAX_SELECTED} 个技能上限", "The ${SkillLimits.MAX_SELECTED}-Skill limit has been reached")
+                                    skills.isEmpty() -> localizedText("创建第一个技能", "Create your first Skill")
+                                    else -> localizedText("没有匹配的技能", "No matching Skill")
+                                }) },
+                                onClick = onSkills,
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = { Text(localizedText("管理技能", "Manage Skills"), color = colors.accent) },
+                            onClick = onSkills,
+                        )
+                    }
+                }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 ComposerIcon(
@@ -2170,6 +2301,58 @@ private fun ChatComposer(
                 }
             }
         }
+    }
+    pendingScopeSkill?.let { skill ->
+        AlertDialog(
+            onDismissRequest = { pendingScopeSkill = null },
+            title = { Text(localizedText("如何使用 /${skill.slashName}？", "How should /${skill.slashName} be used?")) },
+            text = { Text(localizedText("选择只用于下一条消息，或在当前会话中持续启用。", "Use it for the next message only, or keep it active in this conversation.")) },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingScopeSkill = null
+                    onSkillConversation(skill)
+                }) { Text(localizedText("当前会话持续启用", "Keep in conversation")) }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    pendingScopeSkill = null
+                    onSkillOnce(skill)
+                }) { Text(localizedText("仅本轮", "This turn only")) }
+            },
+        )
+    }
+}
+
+private data class SlashMatch(val start: Int, val end: Int, val query: String)
+
+private fun findSlashMatch(value: TextFieldValue): SlashMatch? {
+    if (!value.selection.collapsed) return null
+    val cursor = value.selection.start.coerceIn(0, value.text.length)
+    var start = cursor
+    while (start > 0 && !value.text[start - 1].isWhitespace()) start--
+    val token = value.text.substring(start, cursor)
+    if (!token.startsWith('/') || token.startsWith("//")) return null
+    val query = token.drop(1)
+    if (query.any { !it.isLetterOrDigit() && it != '-' }) return null
+    return SlashMatch(start, cursor, query.lowercase())
+}
+
+@Composable
+private fun ComposerSkillChip(skill: SkillRef, persistent: Boolean, onRemove: () -> Unit) {
+    val colors = LocalChatColors.current
+    Surface(
+        modifier = Modifier.clickable(onClickLabel = localizedText("移除技能", "Remove Skill"), onClick = onRemove),
+        shape = RoundedCornerShape(14.dp),
+        color = if (persistent) colors.accentSoft else colors.surfaceRaised,
+        border = BorderStroke(1.dp, if (persistent) colors.accent.copy(alpha = .3f) else colors.divider),
+    ) {
+        Text(
+            (if (persistent) localizedText("会话 · ", "Chat · ") else "") + "/${skill.slashName}  ×",
+            Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            color = if (persistent) colors.accent else colors.text,
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+        )
     }
 }
 

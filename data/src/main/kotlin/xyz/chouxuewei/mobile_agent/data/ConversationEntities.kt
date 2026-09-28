@@ -13,6 +13,7 @@ internal data class ConversationEntity(
     val attachments: String,
     val reasoningEffort: String?,
     @ColumnInfo(defaultValue = "0") val pinned: Boolean,
+    @ColumnInfo(defaultValue = "'[]'") val draftSkills: String,
 )
 
 @Entity(tableName = "messages", indices = [Index(value = ["conversationId", "sequence"], unique = true)], foreignKeys = [ForeignKey(entity = ConversationEntity::class, parentColumns = ["id"], childColumns = ["conversationId"], onDelete = ForeignKey.CASCADE)])
@@ -29,6 +30,7 @@ internal data class MessageEntity(
     val error: String?,
     @ColumnInfo(defaultValue = "''") val reasoning: String,
     val reasoningDurationMillis: Long?,
+    @ColumnInfo(defaultValue = "'[]'") val skills: String,
 )
 
 /**
@@ -87,8 +89,8 @@ internal interface ConversationDao {
     @Query("SELECT * FROM conversations WHERE id=:id") suspend fun conversation(id: String): ConversationEntity?
     @Query("SELECT * FROM conversations") suspend fun conversations(): List<ConversationEntity>
     @Upsert suspend fun save(conversation: ConversationEntity)
-    @Query("UPDATE conversations SET draft=:text, attachments=:attachments, reasoningEffort=:reasoningEffort WHERE id=:id")
-    suspend fun draft(id: String, text: String, attachments: String, reasoningEffort: String?)
+    @Query("UPDATE conversations SET draft=:text, attachments=:attachments, reasoningEffort=:reasoningEffort, draftSkills=:skills WHERE id=:id")
+    suspend fun draft(id: String, text: String, attachments: String, reasoningEffort: String?, skills: String)
     @Query("UPDATE conversations SET title=:title WHERE id=:id") suspend fun rename(id: String, title: String)
     @Query("UPDATE conversations SET pinned=:pinned WHERE id=:id") suspend fun setPinned(id: String, pinned: Boolean): Int
     @Query("DELETE FROM conversations WHERE id=:id") suspend fun deleteConversation(id: String): Int

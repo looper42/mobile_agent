@@ -85,6 +85,8 @@ internal class ConversationAssembler {
         snapshot: ContextSnapshot?,
         toolHistory: List<ToolCallRecord>,
         systemPrompt: String,
+        activeSkills: Map<String, ResolvedSkill> = emptyMap(),
+        activeSkillMessageSequence: Long? = null,
     ): List<ChatTurn> = buildList {
         add(ChatTurn("system", systemPrompt))
         if (snapshot != null) {
@@ -118,10 +120,16 @@ internal class ConversationAssembler {
                         ),
                     )
                 }
+                val resolvedSkills = if (message.sequence == activeSkillMessageSequence) {
+                    message.skills.mapNotNull { activeSkills[it.versionId] }
+                } else {
+                    emptyList()
+                }
+                val skillBlock = skillInstructionBlock(resolvedSkills)
                 add(
                     ChatTurn(
                         role = message.role.name.lowercase(),
-                        content = message.text + attachmentNote,
+                        content = skillBlock + message.text + attachmentNote,
                         attachmentRefs = message.attachments,
                     ),
                 )
@@ -149,11 +157,16 @@ internal class CompactionPlanner(
         toolHistory: List<ToolCallRecord>,
         systemPrompt: String,
         inputBudget: Int,
+        activeSkills: Map<String, ResolvedSkill> = emptyMap(),
+        activeSkillMessageSequence: Long? = null,
     ): Int {
         val userStarts = history.indices.filter { history[it].role == MessageRole.USER }
         var cut = userStarts.getOrNull(userStarts.size - 2) ?: 0
         if (cut > 0 && estimator.estimate(
-                assembler.assemble(history.drop(cut), null, toolHistory, systemPrompt),
+                assembler.assemble(
+                    history.drop(cut), null, toolHistory, systemPrompt,
+                    activeSkills, activeSkillMessageSequence,
+                ),
             ) > inputBudget * .45
         ) {
             cut = userStarts.last()

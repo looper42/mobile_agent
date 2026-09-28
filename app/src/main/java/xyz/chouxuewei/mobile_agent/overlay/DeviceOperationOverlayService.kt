@@ -49,6 +49,8 @@ import xyz.chouxuewei.mobile_agent.core.Conversation
 import xyz.chouxuewei.mobile_agent.core.ExecutionMode
 import xyz.chouxuewei.mobile_agent.core.Message
 import xyz.chouxuewei.mobile_agent.core.MessageRole
+import xyz.chouxuewei.mobile_agent.core.SkillRef
+import xyz.chouxuewei.mobile_agent.core.StreamingReplySnapshot
 import xyz.chouxuewei.mobile_agent.core.ThemePreference
 import xyz.chouxuewei.mobile_agent.core.ToolApprovalRequest
 import xyz.chouxuewei.mobile_agent.core.ToolCallRecord
@@ -64,6 +66,13 @@ import xyz.chouxuewei.mobile_agent.voice.VoiceInputSource
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputState
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputTarget
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputDestination
+
+private data class OverlayConversationSnapshot(
+    val messages: List<Message>,
+    val calls: List<ToolCallRecord>,
+    val streaming: StreamingReplySnapshot?,
+    val skills: List<SkillRef>,
+)
 
 /**
  * 常驻悬浮助手的系统宿主。业务事实仍来自 ChatRuntime、ConversationStore 和问题代理；
@@ -99,6 +108,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
     private var speechSettings = SpeechSettings()
     private var voiceInputState: VoiceInputState = VoiceInputState.Idle
     private var drafts: Map<String, ComposerDraft> = emptyMap()
+    private var conversationSkills: List<SkillRef> = emptyList()
     private var conversationId: String? = null
     private var messages: List<Message> = emptyList()
     private var calls: List<ToolCallRecord> = emptyList()
@@ -133,6 +143,10 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         override fun editDraft(draft: ComposerDraft) {
             val id = conversationId ?: return
             app.chatWorkspace.edit(id, draft)
+        }
+        override fun removeConversationSkill(skillId: String) {
+            val id = conversationId ?: return
+            app.chatWorkspace.unbindSkill(id, skillId)
         }
         override fun requestInputFocus() = setInputFocusActive(true)
         override fun releaseInputFocus() = setInputFocusActive(false)
@@ -372,16 +386,19 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
                 app.conversations.observeMessages(id),
                 app.conversations.observeToolCalls(id),
                 app.chatRuntime.streamingReplies,
-            ) { currentMessages, currentCalls, streaming -> Triple(currentMessages, currentCalls, streaming[id]) }
-                .collectLatest { (currentMessages, currentCalls, streaming) ->
-                    messages = currentMessages.withStreamingReply(streaming)
-                    calls = currentCalls
+                app.skills.observeConversationSkills(id),
+            ) { currentMessages, currentCalls, streaming, currentSkills ->
+                OverlayConversationSnapshot(currentMessages, currentCalls, streaming[id], currentSkills)
+            }.collectLatest { snapshot ->
+                    messages = snapshot.messages.withStreamingReply(snapshot.streaming)
+                    calls = snapshot.calls
+                    conversationSkills = snapshot.skills
                     val assistant = messages.lastOrNull { it.role == MessageRole.ASSISTANT }
                     responseText = assistant?.assistantSteps
                         ?.map(AssistantStep::text)?.filter(String::isNotBlank)?.joinToString("\n\n")
                         ?.takeIf(String::isNotBlank)
                         ?: assistant?.text.orEmpty()
-                    steps = currentCalls.filter { assistant == null || it.replyMessageId == assistant.id }
+                    steps = calls.filter { assistant == null || it.replyMessageId == assistant.id }
                         .takeLast(8).map { it.overlayStep(toolTitles) }
                     publishState()
                 }
@@ -455,6 +472,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             toolCalls = calls,
             toolTitles = toolTitles,
             draft = drafts[selected] ?: ComposerDraft(),
+            conversationSkills = conversationSkills,
             activeConversations = activeConversations,
             approvals = approvals,
             questions = questions,

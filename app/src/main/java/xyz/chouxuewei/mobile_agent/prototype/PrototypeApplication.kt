@@ -32,6 +32,7 @@ import xyz.chouxuewei.mobile_agent.core.StorageCleanupResult
 import xyz.chouxuewei.mobile_agent.core.UserQuestionBroker
 import xyz.chouxuewei.mobile_agent.data.SpeechSettingsRepository
 import xyz.chouxuewei.mobile_agent.data.AgentExecutionSettingsRepository
+import xyz.chouxuewei.mobile_agent.data.RoomSkillRepository
 import xyz.chouxuewei.mobile_agent.model.SpeechTranscriptionGateway
 import xyz.chouxuewei.mobile_agent.model.IflytekSpeechTranscriptionGateway
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputController
@@ -54,6 +55,7 @@ class PrototypeApplication : Application() {
     val personalization by lazy { PersonalizationRepository(this) }
     val agentExecutionSettings by lazy { AgentExecutionSettingsRepository(this) }
     val speechSettings by lazy { SpeechSettingsRepository(this) }
+    val skills by lazy { RoomSkillRepository(this) }
     val toolPermissions by lazy { ToolPermissionRepository(this) }
     val userQuestions by lazy { UserQuestionBroker() }
     val toolRegistry by lazy {
@@ -81,6 +83,7 @@ class PrototypeApplication : Application() {
             usageRecorder = modelUsage::record,
             personalizedInstructions = personalization::currentInstructions,
             maxStepsPerRun = agentExecutionSettings::currentMaxSteps,
+            skillResolver = skills,
         )
     }
     private val debugModelConfig by lazy {
