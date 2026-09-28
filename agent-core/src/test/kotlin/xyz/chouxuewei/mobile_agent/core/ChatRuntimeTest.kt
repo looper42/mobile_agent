@@ -111,24 +111,7 @@ class ChatRuntimeTest {
             emit(ModelEvent.ToolCall(RequestedToolCall("call-$modelRequests","loop_tool","{}")))
             emit(ModelEvent.Completed("tool_calls"))
         } }
-        val provider=object : ToolProvider {
-            override val id="test"
-            override val title="测试"
-            override val description="测试步骤限制"
-            override val definitions=listOf(ToolDefinition(
-                id="loop_tool",
-                title="循环工具",
-                description="持续请求工具以验证单轮上限",
-                inputSchema="""{"type":"object"}""",
-                sideEffect=ToolSideEffect.READ,
-                providerId=id,
-                requiresPermissionApproval=false,
-            ))
-            override suspend fun execute(call: RequestedToolCall, context: ToolExecutionContext): ToolResult {
-                toolExecutions++
-                return ToolResult("{}","完成")
-            }
-        }
+        val provider=countingLoopToolProvider { toolExecutions++ }
         val runtime=ChatRuntime(
             store=store,
             connection={ _ -> ChatConnection(gateway,ContextPolicy(16000,1024),"test") },
@@ -144,5 +127,55 @@ class ChatRuntimeTest {
             assertEquals(RunStatus.FAILED,store.runs.single().status)
             assertTrue(store.runs.single().error.orEmpty().contains("单轮最大步骤（2）"))
         } finally { scope.cancel() }
+    }
+
+    @Test fun unlimitedMaxStepsAllowsToolRoundsUntilModelFinishes()=runBlocking {
+        val store=MemoryConversationStore()
+        val scope=CoroutineScope(SupervisorJob()+Dispatchers.Unconfined)
+        var modelRequests=0
+        var toolExecutions=0
+        val gateway=ChatModelGateway { flow {
+            modelRequests++
+            if(modelRequests<=3) {
+                emit(ModelEvent.ToolCall(RequestedToolCall("call-$modelRequests","loop_tool","{}")))
+                emit(ModelEvent.Completed("tool_calls"))
+            } else {
+                emit(ModelEvent.TextDelta("完成"))
+                emit(ModelEvent.Completed("stop"))
+            }
+        } }
+        val runtime=ChatRuntime(
+            store=store,
+            connection={ _ -> ChatConnection(gateway,ContextPolicy(16000,1024),"test") },
+            scope=scope,
+            tools=ToolRegistry(listOf(countingLoopToolProvider { toolExecutions++ })),
+            maxStepsPerRun={ UNLIMITED_SINGLE_RUN_MAX_STEPS },
+        )
+        try {
+            runtime.send("c","执行到完成",emptyList())
+            withTimeout(3000) { while(runtime.active.value.isNotEmpty()) yield() }
+            assertEquals(4,modelRequests)
+            assertEquals(3,toolExecutions)
+            assertEquals(RunStatus.SUCCEEDED,store.runs.single().status)
+        } finally { scope.cancel() }
+    }
+}
+
+private fun countingLoopToolProvider(onExecute: () -> Unit)=object : ToolProvider {
+    override val id="test"
+    override val title="测试"
+    override val description="测试步骤限制"
+    override val definitions=listOf(ToolDefinition(
+        id="loop_tool",
+        title="循环工具",
+        description="持续请求工具以验证单轮上限",
+        inputSchema="""{"type":"object"}""",
+        sideEffect=ToolSideEffect.READ,
+        providerId=id,
+        requiresPermissionApproval=false,
+    ))
+    override suspend fun execute(call: RequestedToolCall, context: ToolExecutionContext): ToolResult {
+        onExecute()
+        return ToolResult("{}","完成")
     }
 }

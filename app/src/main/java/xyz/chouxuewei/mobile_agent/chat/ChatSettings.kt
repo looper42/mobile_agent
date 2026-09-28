@@ -88,10 +88,8 @@ import kotlinx.coroutines.launch
 import xyz.chouxuewei.mobile_agent.BuildConfig
 import xyz.chouxuewei.mobile_agent.R
 import xyz.chouxuewei.mobile_agent.core.ContextPolicy
-import xyz.chouxuewei.mobile_agent.core.DEFAULT_SINGLE_RUN_MAX_STEPS
-import xyz.chouxuewei.mobile_agent.core.MAX_SINGLE_RUN_MAX_STEPS
-import xyz.chouxuewei.mobile_agent.core.MIN_SINGLE_RUN_MAX_STEPS
 import xyz.chouxuewei.mobile_agent.core.ThemePreference
+import xyz.chouxuewei.mobile_agent.core.isValidSingleRunMaxSteps
 import xyz.chouxuewei.mobile_agent.core.userFacingMessage
 import xyz.chouxuewei.mobile_agent.core.localizedText
 import xyz.chouxuewei.mobile_agent.data.DEFAULT_REASONING_EFFORTS
@@ -1173,7 +1171,7 @@ private fun SingleRunMaxStepsRow(
         if (!focused) draft = value.toString()
     }
     val parsed = draft.toIntOrNull()
-    val valid = parsed != null && parsed in MIN_SINGLE_RUN_MAX_STEPS..MAX_SINGLE_RUN_MAX_STEPS
+    val valid = parsed?.let(::isValidSingleRunMaxSteps) == true
 
     Row(
         Modifier
@@ -1188,7 +1186,7 @@ private fun SingleRunMaxStepsRow(
         ) {
             Text(localizedText("任务最大步骤", "Maximum task steps"), style = MaterialTheme.typography.bodyMedium)
             Text(
-                localizedText("执行任务时，AI可执行的最大步数", "Maximum steps AI can take per task"),
+                localizedText("AI可执行的最大步数，-1无限制", "Maximum steps AI can take; -1 means unlimited"),
                 Modifier.padding(top = 2.dp),
                 style = MaterialTheme.typography.bodySmall,
                 color = if (draft.isNotEmpty() && !valid) colors.error else colors.secondary,
@@ -1196,7 +1194,7 @@ private fun SingleRunMaxStepsRow(
         }
         Surface(
             modifier = Modifier
-                .size(width = 52.dp, height = 48.dp)
+                .size(width = 96.dp, height = 48.dp)
                 .onGloballyPositioned { onFieldBoundsChanged(it.boundsInWindow()) },
             shape = RoundedCornerShape(14.dp),
             color = colors.surfaceRaised,
@@ -1212,10 +1210,16 @@ private fun SingleRunMaxStepsRow(
             BasicTextField(
                 value = draft,
                 onValueChange = { input ->
-                    draft = input.filter(Char::isDigit).take(3)
-                    draft.toIntOrNull()?.takeIf {
-                        it in MIN_SINGLE_RUN_MAX_STEPS..MAX_SINGLE_RUN_MAX_STEPS && it != value
-                    }?.let(onChange)
+                    val accepted = input.isEmpty() || input == "-" ||
+                        input.all(Char::isDigit) ||
+                        (input.startsWith('-') && input.drop(1).all(Char::isDigit))
+                    if (accepted) {
+                        draft = input
+                        draft.toIntOrNull()
+                            ?.takeIf(::isValidSingleRunMaxSteps)
+                            ?.takeIf { it != value }
+                            ?.let(onChange)
+                    }
                 },
                 modifier = Modifier
                     .fillMaxSize()
@@ -1231,13 +1235,13 @@ private fun SingleRunMaxStepsRow(
                 ),
                 cursorBrush = SolidColor(colors.accent),
                 keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Number,
+                    keyboardType = KeyboardType.Text,
                     imeAction = ImeAction.Done,
                 ),
                 keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
                 singleLine = true,
                 decorationBox = { innerField ->
-                    // 与 Switch 使用相同的 52×48dp 占位，四周仅留少量余量以容纳三位数。
+                    // 高度与 Switch 一致，宽度可展示 Int 范围内的正整数以及 -1。
                     Box(
                         Modifier
                             .fillMaxSize()

@@ -9,8 +9,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import xyz.chouxuewei.mobile_agent.core.DEFAULT_SINGLE_RUN_MAX_STEPS
-import xyz.chouxuewei.mobile_agent.core.MAX_SINGLE_RUN_MAX_STEPS
-import xyz.chouxuewei.mobile_agent.core.MIN_SINGLE_RUN_MAX_STEPS
+import xyz.chouxuewei.mobile_agent.core.isValidSingleRunMaxSteps
 import xyz.chouxuewei.mobile_agent.core.requireValidSingleRunMaxSteps
 
 private val Context.agentExecutionSettingsDataStore by preferencesDataStore("agent_execution_settings")
@@ -22,7 +21,7 @@ class AgentExecutionSettingsRepository(context: Context) {
 
     val maxSteps: Flow<Int> = store.data.map { preferences ->
         preferences[maxStepsKey]
-            ?.takeIf { it in MIN_SINGLE_RUN_MAX_STEPS..MAX_SINGLE_RUN_MAX_STEPS }
+            ?.takeIf(::isValidSingleRunMaxSteps)
             ?: DEFAULT_SINGLE_RUN_MAX_STEPS
     }.distinctUntilChanged()
 

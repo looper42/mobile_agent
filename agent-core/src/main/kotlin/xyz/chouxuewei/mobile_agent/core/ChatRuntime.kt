@@ -223,8 +223,9 @@ class ChatRuntime(
                 val definitions = enabledDefinitions()
                 // 每轮开始时只读取一次，避免用户在执行中修改设置导致当前任务的上限突然变化。
                 val maxSteps = requireValidSingleRunMaxSteps(maxStepsPerRun())
+                val hasStepLimit = maxSteps != UNLIMITED_SINGLE_RUN_MAX_STEPS
                 AgentLog.i("Runtime") {
-                    "run_start run=${activeRun.id} conversation=$id model=${c.model} tools=${definitions.size} max_steps=$maxSteps"
+                    "run_start run=${activeRun.id} conversation=$id model=${c.model} tools=${definitions.size} max_steps=${if (hasStepLimit) maxSteps else "unlimited"}"
                 }
                 val workingTurns = resolveImages(context.prepare(
                     id, trigger.sequence, c.policy, c.model, c.gateway,
@@ -235,7 +236,7 @@ class ChatRuntime(
                 var contextWasCompacted = false
                 var toolRound = 0
                 while (true) {
-                    check(toolRound <= maxSteps) {
+                    check(!hasStepLimit || toolRound <= maxSteps) {
                         localizedText("已达到单轮最大步骤（$maxSteps），可在设置中调整后重试", "The maximum steps for one run ($maxSteps) was reached. Adjust it in Settings and try again.")
                     }
                     var finished = false
@@ -321,7 +322,7 @@ class ChatRuntime(
                         break
                     }
                     check(definitions.isNotEmpty()) { localizedText("模型请求了本轮未提供的工具", "The model requested a tool that was not provided for this run.") }
-                    check(toolRound < maxSteps) {
+                    check(!hasStepLimit || toolRound < maxSteps) {
                         localizedText("已达到单轮最大步骤（$maxSteps），可在设置中调整后重试", "The maximum steps for one run ($maxSteps) was reached. Adjust it in Settings and try again.")
                     }
                     toolRound++
