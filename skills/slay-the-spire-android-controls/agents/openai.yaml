@@ -1,0 +1,4 @@
+interface:
+  display_name: "杀戮尖塔 Android 操作"
+  short_description: "将游戏决策转化为可靠的 Android 触控操作流程"
+  default_prompt: "使用 $slay-the-spire-android-controls 操作当前 Android 版《杀戮尖塔》界面。"

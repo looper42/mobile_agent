@@ -1,3 +1,4 @@
+import com.android.build.gradle.internal.api.BaseVariantOutputImpl
 import java.util.Properties
 
 val localProperties = Properties().apply {
@@ -46,8 +47,8 @@ android {
         applicationId = "xyz.chouxuewei.mobile_agent"
         minSdk = 24
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.2"
+        versionCode = 3
+        versionName = "0.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -97,6 +98,16 @@ android {
         compose = true
         aidl = true
         buildConfig = true
+    }
+
+    applicationVariants.all {
+        val apkVersionName = checkNotNull(versionName) {
+            "必须配置 versionName 才能生成 APK 文件名"
+        }
+        outputs.all {
+            (this as BaseVariantOutputImpl).outputFileName =
+                "Mobile_agent_v$apkVersionName.apk"
+        }
     }
 }
 

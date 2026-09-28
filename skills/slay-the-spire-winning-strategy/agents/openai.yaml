@@ -1,0 +1,4 @@
+interface:
+  display_name: "杀戮尖塔获胜策略"
+  short_description: "制定以稳定通关为目标的战斗、构筑、路线与资源管理决策"
+  default_prompt: "使用 $slay-the-spire-winning-strategy 分析当前《杀戮尖塔》局面并决定下一步。"

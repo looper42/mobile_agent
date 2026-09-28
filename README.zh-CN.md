@@ -6,6 +6,33 @@ Mobile Agent 是一款面向 Android 的开源 AI 聊天与本地工具应用。
 
 > 当前项目处于早期开发阶段，接口、数据结构和交互仍可能调整。请先在测试设备上使用，不要将它用于支付或账号安全操作。
 
+## 运行效果
+
+![Mobile Agent 操作 Android 版《杀戮尖塔》](docs/images/mobile-agent-slay-the-spire.png)
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="docs/images/mobile-agent-skill-guided-control.png" width="280" alt="Skill 指导下的 Android 游戏操作"><br>
+      <sub>Skill 指导下的游戏操作</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/mobile-agent-model-settings.png" width="280" alt="OpenAI 兼容模型服务设置"><br>
+      <sub>可配置的模型服务</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/mobile-agent-tool-controls.png" width="280" alt="工具可用性与权限控制"><br>
+      <sub>细粒度工具能力控制</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/mobile-agent-skill-management.png" width="280" alt="已安装 Skill 管理"><br>
+      <sub>Skill 安装与管理</sub>
+    </td>
+  </tr>
+</table>
+
 ## 主要能力
 
 - 多轮聊天、上下文压缩和模型用量统计。
@@ -16,11 +43,7 @@ Mobile Agent 是一款面向 Android 的开源 AI 聊天与本地工具应用。
 
 ## 未来计划
 
-- [ ] 扩展 PDF、Word、Excel 等文件格式的读取与生成功能。
-- [ ] 优化模型调用性能，减少多工具任务执行过程中的无效步骤。
-- [ ] 提升屏幕识别的准确性和效率，使设备操作更加稳定可靠。
-- [ ] 为非 Root 用户增加降级设备控制：支持用户主动启用的无障碍能力与 Shizuku 前台操作能力。
-- [ ] 在保持明确授权和数据边界的前提下，增加更多实用工具与服务集成。
+项目正在持续更新中...
 
 ## 权限和数据边界
 

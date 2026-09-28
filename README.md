@@ -6,6 +6,33 @@ Mobile Agent is an open-source AI chat and local-tool application for Android. I
 
 > This project is in an early stage of development. Its APIs, data structures, and interactions may still change. Use it on a test device first, and do not use it for payments or account-security operations.
 
+## In Action
+
+![Mobile Agent controlling Slay the Spire on Android](docs/images/mobile-agent-slay-the-spire.png)
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="docs/images/mobile-agent-skill-guided-control.png" width="280" alt="Skill-guided Android game control"><br>
+      <sub>Skill-guided game control</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/mobile-agent-model-settings.png" width="280" alt="OpenAI-compatible model service settings"><br>
+      <sub>Configurable model services</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/mobile-agent-tool-controls.png" width="280" alt="Tool availability and permission controls"><br>
+      <sub>Per-tool capability controls</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/mobile-agent-skill-management.png" width="280" alt="Installed skill management"><br>
+      <sub>Skill installation and management</sub>
+    </td>
+  </tr>
+</table>
+
 ## Key Features
 
 - Multi-turn conversations, context compression, and model usage statistics.
@@ -16,11 +43,7 @@ Mobile Agent is an open-source AI chat and local-tool application for Android. I
 
 ## Roadmap
 
-- [ ] Expand file reading and generation support to PDF, Word, and Excel documents.
-- [ ] Improve model-call performance and reduce redundant steps during multi-tool task execution.
-- [ ] Improve screen recognition accuracy and efficiency for more reliable device automation.
-- [ ] Add degraded device-control support for non-root users through user-enabled Accessibility and Shizuku foreground operations.
-- [ ] Add more practical tools and integrations while preserving explicit permission and data boundaries.
+The project is continuously being updated...
 
 ## Permissions and Data Boundaries
 
