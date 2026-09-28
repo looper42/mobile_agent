@@ -2,6 +2,7 @@ package xyz.chouxuewei.mobile_agent.tools
 
 import android.os.SystemClock
 import xyz.chouxuewei.mobile_agent.core.localizedText
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.NonCancellable
@@ -50,9 +51,16 @@ internal fun deviceToolSchema(schema: String): String {
     }).toString()
 }
 
-class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
+class DeviceToolProvider internal constructor(
+    private val gateway: DeviceGateway,
+    private val coordinateDebugSink: DeviceCoordinateDebugSink?,
+) : ToolProvider {
+    constructor(gateway: DeviceGateway) : this(gateway, null)
+
     private val sessionGate = Mutex()
     private val sessionsByRun = mutableMapOf<String, MutableSet<String>>()
+    private val coordinateGate = Mutex()
+    private val coordinatesBySession = mutableMapOf<String, ModelCoordinateObservation>()
     override val id = "device"
     override val title get() = localizedText("手机操作", "Phone operation")
     override val description
@@ -110,7 +118,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         ToolDefinition(
             "device_observe",
             localizedText("识别手机界面", "Inspect phone screen"),
-            localizedText("读取当前设备会话的前台应用、截图、坐标范围和可访问节点，并返回一次性 observation_id。节点和截图只对紧接着的一次模型决策有效，随后自动清除；继续操作必须重新识别。可用 query 或 required_action 筛选复杂界面；nodes_truncated=true 时缩小条件重新识别。", "Read the foreground app, screenshot, coordinate range, and accessible nodes for the current device session, returning a one-time observation_id. Nodes and screenshots are valid only for the immediately following model decision and are then cleared; inspect again before continuing. Use query or required_action to filter complex screens, and narrow the filter when nodes_truncated=true."),
+            localizedText("读取当前设备会话的前台应用、截图、坐标范围和可访问节点，并返回一次性 observation_id。截图四周黑底白色标尺使用整张图片的像素坐标；坐标动作必须返回包含黑边在内的图片坐标，App 会在本地换算为屏幕坐标。节点和截图只对紧接着的一次模型决策有效，随后自动清除；继续操作必须重新识别。可用 query 或 required_action 筛选复杂界面；nodes_truncated=true 时缩小条件重新识别。", "Read the foreground app, screenshot, coordinate range, and accessible nodes for the current device session, returning a one-time observation_id. The white ruler uses full-image pixel coordinates including the black border. Coordinate actions must return those image coordinates; the app converts them to screen coordinates locally. Nodes and screenshots are valid only for the immediately following model decision and are then cleared; inspect again before continuing. Use query or required_action to filter complex screens, and narrow the filter when nodes_truncated=true."),
             deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")},"query":{"type":"string","maxLength":200,"description":localizedText("可选，筛选文字、描述、提示、view_id 或类名", "Optional filter for text, description, hint, view_id, or class name")},"required_action":{"type":"string","enum":["click","long_click","scroll_forward","scroll_backward","scroll_up","scroll_down","scroll_left","scroll_right","set_text"]},"limit":{"type":"integer","minimum":1,"maximum":200,"default":80}},"required":["session_id"],"additionalProperties":false}"""),
             ToolSideEffect.READ,
             "device",
@@ -120,13 +128,13 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         ToolDefinition(
             "device_action", localizedText("操作手机", "Phone control"),
             localizedText("每次只执行一个动作。优先使用 click_node、long_click_node、scroll_node 等节点语义动作；节点不支持时才使用坐标。open_app 可省略 observation_id；其他动作必须原样使用最近一次 device_observe 返回的准确 ID。动作成功后该识别结果立即失效，继续操作前必须重新识别。", "Run exactly one action. Prefer semantic node actions such as click_node, long_click_node, and scroll_node; use coordinates only when the node does not support the action. open_app may omit observation_id; every other action must copy the exact ID from the latest device_observe. A successful action immediately expires that observation, so inspect again before continuing."),
-            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")},"observation_id":{"type":"string","description":localizedText("open_app 可省略；其他动作必须使用最近一次 device_observe 返回的一次性准确 ID", "open_app may omit this; every other action must use the one-time exact ID from the latest device_observe")},"action":{"type":"string","enum":["click_node","long_click_node","scroll_node","tap","long_press","swipe","input_text","back","enter","home","recents","escape","delete","tab","dpad_up","dpad_down","dpad_left","dpad_right","open_app","wait"]},"x":{"type":"integer","description":localizedText("点击或滑动起点横坐标，来自当前识别结果", "Tap or swipe start X coordinate from the current observation")},"y":{"type":"integer","description":localizedText("点击或滑动起点纵坐标，来自当前识别结果", "Tap or swipe start Y coordinate from the current observation")},"end_x":{"type":"integer","description":localizedText("滑动终点横坐标", "Swipe end X coordinate")},"end_y":{"type":"integer","description":localizedText("滑动终点纵坐标", "Swipe end Y coordinate")},"duration_ms":{"type":"integer"},"text":{"type":"string","maxLength":500,"description":localizedText("仅用于 input_text；replace 模式传空字符串可清空输入框", "Used only for input_text; an empty string in replace mode clears the field")},"input_mode":{"type":"string","enum":["replace","append"],"default":"replace"},"node_ref":{"type":"string","description":localizedText("节点语义动作必须提供；input_text 可选；值必须来自当前识别结果", "Node semantic action is required; input_text is optional; values must come from the current observation")},"scroll_direction":{"type":"string","enum":["forward","backward","up","down","left","right"],"description":localizedText("仅用于 scroll_node", "Used only for scroll_node")},"package_name":{"type":"string","description":localizedText("仅用于 open_app，必须原样复制 device_list_apps 返回的 package_name", "Used only for open_app; copy package_name exactly from device_list_apps")}},"required":["session_id","action"],"additionalProperties":false}"""),
+            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string","description":localizedText("当前执行轮次中 device_open 返回的真实会话 ID", "Actual session ID returned by device_open in the current run")},"observation_id":{"type":"string","description":localizedText("open_app 可省略；其他动作必须使用最近一次 device_observe 返回的一次性准确 ID", "open_app may omit this; every other action must use the one-time exact ID from the latest device_observe")},"action":{"type":"string","enum":["click_node","long_click_node","scroll_node","tap","long_press","swipe","input_text","back","enter","home","recents","escape","delete","tab","dpad_up","dpad_down","dpad_left","dpad_right","open_app","wait"]},"x":{"type":"integer","description":localizedText("包含黑边的完整截图像素横坐标；App 会自动减去标尺边距", "Full screenshot pixel X coordinate including the black border; the app subtracts the ruler padding")},"y":{"type":"integer","description":localizedText("包含黑边的完整截图像素纵坐标；App 会自动减去标尺边距", "Full screenshot pixel Y coordinate including the black border; the app subtracts the ruler padding")},"target_box":{"type":"object","description":localizedText("tap 或 long_press 优先提供目标在完整截图中的边界框，App 点击其中心", "For tap or long_press, preferably provide the target bounding box in full-image pixels; the app taps its center"),"properties":{"left":{"type":"integer"},"top":{"type":"integer"},"right":{"type":"integer"},"bottom":{"type":"integer"}},"required":["left","top","right","bottom"],"additionalProperties":false},"end_x":{"type":"integer","description":localizedText("滑动终点在包含黑边的完整截图中的横坐标", "Swipe endpoint X coordinate in the full screenshot including the black border")},"end_y":{"type":"integer","description":localizedText("滑动终点在包含黑边的完整截图中的纵坐标", "Swipe endpoint Y coordinate in the full screenshot including the black border")},"duration_ms":{"type":"integer"},"text":{"type":"string","maxLength":500,"description":localizedText("仅用于 input_text；replace 模式传空字符串可清空输入框", "Used only for input_text; an empty string in replace mode clears the field")},"input_mode":{"type":"string","enum":["replace","append"],"default":"replace"},"node_ref":{"type":"string","description":localizedText("节点语义动作必须提供；input_text 可选；值必须来自当前识别结果", "Node semantic action is required; input_text is optional; values must come from the current observation")},"scroll_direction":{"type":"string","enum":["forward","backward","up","down","left","right"],"description":localizedText("仅用于 scroll_node", "Used only for scroll_node")},"package_name":{"type":"string","description":localizedText("仅用于 open_app，必须原样复制 device_list_apps 返回的 package_name", "Used only for open_app; copy package_name exactly from device_list_apps")}},"required":["session_id","action"],"additionalProperties":false}"""),
             ToolSideEffect.EXTERNAL_WRITE, "device",
             approvalDescription = localizedText("在手机上执行一次操作。", "Run one action on the phone."),
         ),
         ToolDefinition(
             "device_batch", localizedText("批量操作手机", "Batch phone operations"),
-            localizedText("在手机本地连续执行 1 到 20 个步骤，减少每次点击后都请求模型。每步会轻量识别当前界面，并用 target_text、target_description 或 target_view_id 重新定位节点；不得为后续步骤复用旧 node_ref。任一步不匹配、跳到错误应用或执行失败时立即停止，并返回最新界面。坐标动作只能用在确认不会变化的当前布局。不要把支付、验证码、账号安全或系统授权确认放入批量执行。", "Execute 1 to 20 steps locally on the phone to avoid a model request after every tap. Each step performs a lightweight screen inspection and relocates nodes with target_text, target_description, or target_view_id; never reuse an old node_ref for later steps. Stop immediately and return the latest screen if a step does not match, reaches the wrong app, or fails. Use coordinate actions only on a confirmed stable layout. Never batch payments, verification codes, account security, or system permission confirmations."),
+            localizedText("在手机本地连续执行 1 到 20 个步骤，减少每次点击后都请求模型。每步会轻量识别当前界面，并用 target_text、target_description 或 target_view_id 重新定位节点；不得为后续步骤复用旧 node_ref。任一步不匹配、跳到错误应用或执行失败时立即停止，并返回最新界面。坐标动作使用最近一次识别中包含黑边的完整截图坐标，App 会本地换算；只能用于确认不会变化的当前布局。不要把支付、验证码、账号安全或系统授权确认放入批量执行。", "Execute 1 to 20 steps locally on the phone to avoid a model request after every tap. Each step performs a lightweight screen inspection and relocates nodes with target_text, target_description, or target_view_id; never reuse an old node_ref for later steps. Stop immediately and return the latest screen if a step does not match, reaches the wrong app, or fails. Coordinate actions use full screenshot coordinates including the black border from the latest observation and are converted locally; use them only on a confirmed stable layout. Never batch payments, verification codes, account security, or system permission confirmations."),
             BATCH_SCHEMA,
             ToolSideEffect.EXTERNAL_WRITE, "device",
             approvalDescription = localizedText("在手机上连续执行一组已列出的操作，失败时立即停止。", "Execute a listed sequence of phone actions and stop immediately on failure."),
@@ -134,8 +142,8 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         ),
         ToolDefinition(
             "device_gesture", localizedText("执行复杂触控", "Run complex touch gesture"),
-            localizedText("在最近一次识别结果的坐标系中执行一组轨迹。单条多点轨迹可在画板连续画线；多条 start_time_ms 相同的轨迹会并行执行，可用于双指缩放。一次最多 10 条轨迹、共 500 个点、总时长 10 秒。", "Execute gesture paths in the coordinate system of the latest observation. A multi-point path can draw continuously; paths with the same start_time_ms run in parallel for gestures such as pinch zoom. Up to 10 paths, 500 points total, and 10 seconds."),
-            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string"},"observation_id":{"type":"string","description":localizedText("最近一次 device_observe 返回的准确 ID", "Exact ID returned by the latest device_observe")},"strokes":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"points":{"type":"array","minItems":2,"maxItems":500,"items":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"],"additionalProperties":false}},"start_time_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"duration_ms":{"type":"integer","minimum":1,"maximum":10000}},"required":["points","duration_ms"],"additionalProperties":false}}},"required":["session_id","observation_id","strokes"],"additionalProperties":false}"""),
+            localizedText("使用最近一次识别结果中包含黑边的完整截图坐标执行一组轨迹，App 会在本地换算为屏幕坐标。单条多点轨迹可连续画线；多条 start_time_ms 相同的轨迹会并行执行，可用于双指缩放。一次最多 10 条轨迹、共 500 个点、总时长 10 秒。", "Execute gesture paths using full screenshot coordinates including the black border from the latest observation; the app converts them to screen coordinates locally. A multi-point path can draw continuously; paths with the same start_time_ms run in parallel for gestures such as pinch zoom. Up to 10 paths, 500 points total, and 10 seconds."),
+            deviceToolSchema("""{"type":"object","properties":{"session_id":{"type":"string"},"observation_id":{"type":"string","description":localizedText("最近一次 device_observe 返回的准确 ID", "Exact ID returned by the latest device_observe")},"strokes":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"points":{"type":"array","minItems":2,"maxItems":500,"items":{"type":"object","properties":{"x":{"type":"integer","description":localizedText("包含黑边的完整截图像素横坐标", "Full screenshot pixel X coordinate including the black border")},"y":{"type":"integer","description":localizedText("包含黑边的完整截图像素纵坐标", "Full screenshot pixel Y coordinate including the black border")}},"required":["x","y"],"additionalProperties":false}},"start_time_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"duration_ms":{"type":"integer","minimum":1,"maximum":10000}},"required":["points","duration_ms"],"additionalProperties":false}}},"required":["session_id","observation_id","strokes"],"additionalProperties":false}"""),
             ToolSideEffect.EXTERNAL_WRITE, "device",
             approvalDescription = localizedText("在手机上执行连续轨迹或多指手势。", "Run continuous paths or multi-touch gestures on the phone."),
         ),
@@ -302,7 +310,32 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                 localizedText("缺少参数 observation_id；请先调用 device_observe，并使用它返回的准确 ID", "Missing observation_id. Call device_observe first and use the exact ID it returns.")
             }
         }
-        val action = when (actionName) {
+        val coordinateObservation = if (actionName in COORDINATE_ACTIONS) {
+            requireCoordinateObservation(session, requireNotNull(observation))
+        } else null
+        val debugPoints = mutableListOf<ImagePointMapping>()
+        var debugTargetBox: ImageTargetBox? = null
+        fun mappedPoint(imageX: Int, imageY: Int): ImagePointMapping {
+            val mapped = requireNotNull(coordinateObservation).transform.mapPoint(imageX, imageY)
+            debugPoints += mapped
+            require(mapped.insideContent) {
+                localizedText(
+                    "模型返回的图片坐标 ($imageX,$imageY) 落在黑边外，请重新识别后选择手机画面内部的目标",
+                    "The model image coordinate ($imageX,$imageY) is outside the phone content. Inspect again and choose a target inside the phone image.",
+                )
+            }
+            return mapped
+        }
+        fun targetPoint(): ImagePointMapping {
+            val box = targetBox(args)
+            if (box != null) {
+                debugTargetBox = box
+                return mappedPoint(box.centerX, box.centerY)
+            }
+            return mappedPoint(int(args, "x"), int(args, "y"))
+        }
+        val action = try {
+            when (actionName) {
             "click_node" -> Action.PerformNodeAction(
                 NodeRef(required(args, "node_ref")),
                 NodeActionKind.CLICK,
@@ -326,20 +359,22 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                 },
             )
 
-            "tap" -> Action.Tap(int(args, "x"), int(args, "y"))
-            "long_press" -> Action.LongPress(
-                int(args, "x"),
-                int(args, "y"),
-                int(args, "duration_ms", 700)
-            )
+            "tap" -> targetPoint().let { Action.Tap(it.screenX, it.screenY) }
+            "long_press" -> targetPoint().let {
+                Action.LongPress(it.screenX, it.screenY, int(args, "duration_ms", 700))
+            }
 
-            "swipe" -> Action.Swipe(
-                int(args, "x"),
-                int(args, "y"),
-                int(args, "end_x"),
-                int(args, "end_y"),
-                int(args, "duration_ms", 350)
-            )
+            "swipe" -> {
+                val start = mappedPoint(int(args, "x"), int(args, "y"))
+                val end = mappedPoint(int(args, "end_x"), int(args, "end_y"))
+                Action.Swipe(
+                    start.screenX,
+                    start.screenY,
+                    end.screenX,
+                    end.screenY,
+                    int(args, "duration_ms", 350),
+                )
+            }
 
             "input_text" -> Action.InputText(
                 args["text"]?.jsonPrimitive?.contentOrNull ?: error(localizedText("缺少参数 text", "Missing parameter: text")),
@@ -365,8 +400,24 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             "open_app" -> Action.OpenApp(AppTarget(required(args, "package_name")))
             "wait" -> Action.Wait(int(args, "duration_ms", 500).toLong())
             else -> error(localizedText("不支持的设备动作", "Unsupported device action"))
+            }
+        } finally {
+            if (coordinateObservation != null && debugPoints.isNotEmpty()) {
+                coordinateDebugSink?.record(
+                    CoordinateDebugRecord(
+                        observation = coordinateObservation,
+                        action = actionName,
+                        points = debugPoints.toList(),
+                        targetBox = debugTargetBox,
+                    )
+                )
+            }
         }
-        return when (val result = gateway.execute(session, observation, action)) {
+        val result = gateway.execute(session, observation, action)
+        if (result is ActionResult.Performed && observation != null) {
+            clearCoordinateObservation(session, observation)
+        }
+        return when (result) {
             is ActionResult.Performed -> ToolResult(
                 "{\"performed\":true}",
                 result.detail.ifBlank { localizedText("手机操作已完成", "Phone operation completed") })
@@ -383,6 +434,15 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         val session = required(args, "session_id")
         requireOwned(context, session)
         val steps = parseBatchSteps(args)
+        val latestCoordinateObservation = coordinateObservationOrNull(session)
+        val coordinateObservation = if (steps.any { it.action in BATCH_COORDINATE_ACTIONS }) {
+            latestCoordinateObservation ?: throw BatchStepFailure(
+                localizedText(
+                    "批量坐标动作前必须先调用 device_observe",
+                    "Call device_observe before a batch containing coordinate actions.",
+                )
+            )
+        } else null
         val initialPackage =
             args["expected_package"]?.jsonPrimitive?.contentOrNull?.takeIf(String::isNotBlank)
         val finalObservation = args["final_observation"]?.jsonPrimitive?.booleanOrNull ?: true
@@ -398,7 +458,12 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                 AgentLog.d("DeviceBatch") {
                     "step_start session=$session index=$index action=${step.action}"
                 }
-                completed += executeBatchStep(session, step, expectedPackage)
+                completed += executeBatchStep(
+                    session,
+                    step,
+                    expectedPackage,
+                    coordinateObservation,
+                )
                 AgentLog.d("DeviceBatch") {
                     "step_finish session=$session index=$index action=${step.action}"
                 }
@@ -407,6 +472,9 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             } catch (failure: Exception) {
                 AgentLog.w("DeviceBatch", failure) {
                     "batch_stopped session=$session index=$index action=${step.action} completed=${completed.size}"
+                }
+                latestCoordinateObservation?.let {
+                    clearCoordinateObservation(session, it.observationId)
                 }
                 return batchResult(
                     session = session,
@@ -421,6 +489,9 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         AgentLog.i("DeviceBatch") {
             "batch_finish session=$session completed=${completed.size} duration_ms=${SystemClock.elapsedRealtime() - startedAt}"
         }
+        latestCoordinateObservation?.let {
+            clearCoordinateObservation(session, it.observationId)
+        }
         return batchResult(
             session = session,
             plannedSteps = steps.size,
@@ -433,6 +504,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         session: String,
         step: BatchStep,
         expectedPackage: String?,
+        coordinateObservation: ModelCoordinateObservation?,
     ): String {
         val value = step.value
         if (step.action == "wait_until") {
@@ -471,7 +543,29 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                 )
             }
         }
-        val action = when (step.action) {
+        val debugPoints = mutableListOf<ImagePointMapping>()
+        var debugTargetBox: ImageTargetBox? = null
+        fun mappedPoint(imageX: Int, imageY: Int): ImagePointMapping {
+            val mapped = requireNotNull(coordinateObservation).transform.mapPoint(imageX, imageY)
+            debugPoints += mapped
+            requireBatch(mapped.insideContent) {
+                localizedText(
+                    "批量步骤的图片坐标 ($imageX,$imageY) 落在黑边外",
+                    "The batch step image coordinate ($imageX,$imageY) is outside the phone content.",
+                )
+            }
+            return mapped
+        }
+        fun targetPoint(): ImagePointMapping {
+            val box = targetBox(value)
+            if (box != null) {
+                debugTargetBox = box
+                return mappedPoint(box.centerX, box.centerY)
+            }
+            return mappedPoint(int(value, "x"), int(value, "y"))
+        }
+        val action = try {
+            when (step.action) {
             "click" -> Action.PerformNodeAction(
                 selectBatchNode(requireNotNull(observation), value, NodeActionKind.CLICK).ref,
                 NodeActionKind.CLICK,
@@ -504,22 +598,31 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                 },
             )
 
-            "tap" -> Action.Tap(int(value, "x"), int(value, "y"))
-            "long_press" -> Action.LongPress(
-                int(value, "x"),
-                int(value, "y"),
-                int(value, "duration_ms", 700)
-            )
+            "tap" -> targetPoint().let { Action.Tap(it.screenX, it.screenY) }
+            "long_press" -> targetPoint().let {
+                Action.LongPress(it.screenX, it.screenY, int(value, "duration_ms", 700))
+            }
 
-            "swipe" -> Action.Swipe(
-                int(value, "x"), int(value, "y"), int(value, "end_x"), int(value, "end_y"),
-                int(value, "duration_ms", 350),
-            )
+            "swipe" -> {
+                val start = mappedPoint(int(value, "x"), int(value, "y"))
+                val end = mappedPoint(int(value, "end_x"), int(value, "end_y"))
+                Action.Swipe(
+                    start.screenX,
+                    start.screenY,
+                    end.screenX,
+                    end.screenY,
+                    int(value, "duration_ms", 350),
+                )
+            }
 
             "gesture" -> Action.MultiStrokeGesture(
-                parseStrokes(
-                    value["strokes"]?.jsonArray ?: throw BatchStepFailure(localizedText("轨迹缺少 strokes", "Gesture is missing strokes.")),
-                )
+                mapStrokesToScreen(
+                    parseStrokes(
+                        value["strokes"]?.jsonArray ?: throw BatchStepFailure(localizedText("轨迹缺少 strokes", "Gesture is missing strokes.")),
+                    ),
+                    requireNotNull(coordinateObservation),
+                    debugPoints,
+                ),
             )
 
             "back" -> Action.PressKey(DeviceKey.BACK)
@@ -535,6 +638,18 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             "dpad_right" -> Action.PressKey(DeviceKey.DPAD_RIGHT)
             "open_app" -> Action.OpenApp(AppTarget(required(value, "package_name")))
             else -> throw BatchStepFailure(localizedText("不支持的批量动作 ${step.action}", "Unsupported batch action ${step.action}"))
+            }
+        } finally {
+            if (coordinateObservation != null && debugPoints.isNotEmpty()) {
+                coordinateDebugSink?.record(
+                    CoordinateDebugRecord(
+                        observation = coordinateObservation,
+                        action = "batch:${step.action}",
+                        points = debugPoints.toList(),
+                        targetBox = debugTargetBox,
+                    )
+                )
+            }
         }
         val observationId = if (action is Action.OpenApp) null else requireNotNull(observation).id
         when (val result = gateway.execute(session, observationId, action)) {
@@ -734,6 +849,24 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         return strokes
     }
 
+    private fun mapStrokesToScreen(
+        strokes: List<GestureStroke>,
+        observation: ModelCoordinateObservation,
+        debugPoints: MutableList<ImagePointMapping>,
+    ): List<GestureStroke> = strokes.map { stroke ->
+        stroke.copy(points = stroke.points.map { point ->
+            val mapped = observation.transform.mapPoint(point.x, point.y)
+            debugPoints += mapped
+            require(mapped.insideContent) {
+                localizedText(
+                    "模型返回的轨迹坐标 (${point.x},${point.y}) 落在黑边外，请重新识别后选择手机画面内部的点",
+                    "The model gesture coordinate (${point.x},${point.y}) is outside the phone content. Inspect again and choose points inside the phone image.",
+                )
+            }
+            GesturePoint(mapped.screenX, mapped.screenY)
+        })
+    }
+
     private fun scrollAction(direction: String): NodeActionKind = when (direction) {
         "forward" -> NodeActionKind.SCROLL_FORWARD
         "backward" -> NodeActionKind.SCROLL_BACKWARD
@@ -796,12 +929,29 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         val session = required(args, "session_id")
         requireOwned(context, session)
         val observation = required(args, "observation_id")
-        val strokes = parseStrokes(args["strokes"]?.jsonArray ?: error(localizedText("缺少参数 strokes", "Missing parameter: strokes")))
-        return when (val result = gateway.execute(
+        val coordinateObservation = requireCoordinateObservation(session, observation)
+        val debugPoints = mutableListOf<ImagePointMapping>()
+        val imageStrokes = parseStrokes(args["strokes"]?.jsonArray ?: error(localizedText("缺少参数 strokes", "Missing parameter: strokes")))
+        val strokes = try {
+            mapStrokesToScreen(imageStrokes, coordinateObservation, debugPoints)
+        } finally {
+            if (debugPoints.isNotEmpty()) {
+                coordinateDebugSink?.record(
+                    CoordinateDebugRecord(
+                        observation = coordinateObservation,
+                        action = "gesture",
+                        points = debugPoints.toList(),
+                    )
+                )
+            }
+        }
+        val result = gateway.execute(
             session,
             observation,
             Action.MultiStrokeGesture(strokes),
-        )) {
+        )
+        if (result is ActionResult.Performed) clearCoordinateObservation(session, observation)
+        return when (result) {
             is ActionResult.Performed -> ToolResult(
                 """{"performed":true,"stroke_count":${strokes.size},"point_count":${strokes.sumOf { it.points.size }}}""",
                 localizedText("已执行 ${strokes.size} 条连续轨迹", "Executed ${strokes.size} continuous gesture paths"),
@@ -879,7 +1029,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         is DeviceResult.Failure -> failed(result.reason)
     }
 
-    private fun observationResult(
+    private suspend fun observationResult(
         value: Observation,
         summary: String? = null,
         query: String? = null,
@@ -904,6 +1054,68 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             .toList()
         val returnedNodes = matchingNodes.take(limit.coerceIn(1, 200))
         val screenshot = value.screenshot
+        val annotatedScreenshot = screenshot?.let { image ->
+            withContext(Dispatchers.Default) {
+                runCatching { annotateScreenshotWithCoordinateRuler(image) }
+                    .onFailure { error ->
+                        AgentLog.w("Device", error) {
+                            "coordinate_ruler_failed observation=${value.id} width=${image.width} height=${image.height}"
+                        }
+                    }
+                    .getOrNull()
+            }
+        }
+        val imagePadding = annotatedScreenshot?.padding ?: 0
+        val modelImageWidth = annotatedScreenshot?.width ?: screenshot?.width
+        val modelImageHeight = annotatedScreenshot?.height ?: screenshot?.height
+        val modelImageBytes = annotatedScreenshot?.bytes ?: screenshot?.bytes
+        val modelImageMimeType = annotatedScreenshot?.mimeType ?: screenshot?.mimeType
+        val coordinateObservation = if (
+            screenshot != null &&
+            modelImageWidth != null &&
+            modelImageHeight != null &&
+            modelImageBytes != null &&
+            modelImageMimeType != null &&
+            screenshot.width == value.viewport.width &&
+            screenshot.height == value.viewport.height
+        ) {
+            runCatching {
+                ModelCoordinateObservation(
+                    sessionId = value.sessionId,
+                    observationId = value.id,
+                    transform = ImageCoordinateTransform(
+                        screenWidth = value.viewport.width,
+                        screenHeight = value.viewport.height,
+                        imageWidth = modelImageWidth,
+                        imageHeight = modelImageHeight,
+                        padding = imagePadding,
+                    ),
+                    debugImage = if (coordinateDebugSink == null) null else CoordinateDebugImage(
+                        bytes = modelImageBytes,
+                        mimeType = modelImageMimeType,
+                        width = modelImageWidth,
+                        height = modelImageHeight,
+                    ),
+                )
+            }.onFailure { error ->
+                AgentLog.w("Device", error) {
+                    "coordinate_transform_failed observation=${value.id} " +
+                            "viewport=${value.viewport.width}x${value.viewport.height} " +
+                            "screenshot=${screenshot.width}x${screenshot.height} " +
+                            "image=${modelImageWidth}x${modelImageHeight} padding=$imagePadding"
+                }
+            }.getOrNull()
+        } else {
+            if (screenshot != null) {
+                AgentLog.w("Device") {
+                    "coordinate_transform_skipped observation=${value.id} " +
+                            "viewport=${value.viewport.width}x${value.viewport.height} " +
+                            "screenshot=${screenshot.width}x${screenshot.height}"
+                }
+            }
+            null
+        }
+        rememberCoordinateObservation(value.sessionId, coordinateObservation)
         return ToolResult(
             content = buildJsonObject {
                 put("observation_id", value.id)
@@ -915,6 +1127,32 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                 put("height", value.viewport.height)
                 put("rotation_degrees", value.rotationDegrees)
                 put("screenshot_attached", screenshot != null)
+                putJsonObject("coordinate_system") {
+                    put("origin", "image_top_left")
+                    put("unit", "annotated_image_pixel")
+                    putJsonArray("x_range") { add(0); add((modelImageWidth ?: value.viewport.width) - 1) }
+                    putJsonArray("y_range") { add(0); add((modelImageHeight ?: value.viewport.height) - 1) }
+                    put("screen_width", value.viewport.width)
+                    put("screen_height", value.viewport.height)
+                    put("ruler_attached", annotatedScreenshot != null)
+                    put(
+                        "instruction",
+                        localizedText(
+                            "在确定目标坐标前，必须以图片黑边上的坐标为基准进行尽量准确的估算。所有坐标都必须使用包含黑边的完整截图像素坐标，并包含黑边偏移；App 会在本地换算为屏幕坐标。tap 和 long_press 优先返回目标完整可触控区域的 target_box，由 App 点击其中心。",
+                            "Before determining target coordinates, you must use the coordinates on the image's black border as the reference and estimate the target position as accurately as possible. All coordinates must use full screenshot pixels including the black-border offset; the app converts them to screen coordinates locally. For tap and long_press, prefer the full touchable target_box so the app can tap its center.",
+                        ),
+                    )
+                    if (screenshot != null && modelImageWidth != null && modelImageHeight != null) {
+                        put("image_width", modelImageWidth)
+                        put("image_height", modelImageHeight)
+                        putJsonObject("content_rect_in_image") {
+                            put("left", imagePadding)
+                            put("top", imagePadding)
+                            put("right_exclusive", imagePadding + screenshot.width)
+                            put("bottom_exclusive", imagePadding + screenshot.height)
+                        }
+                    }
+                }
                 put("node_count", value.nodes.size)
                 put("matching_node_count", matchingNodes.size)
                 put("nodes_returned", returnedNodes.size)
@@ -933,6 +1171,12 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                             put("top", node.bounds.top)
                             put("right", node.bounds.right)
                             put("bottom", node.bounds.bottom)
+                            putJsonObject("image_bounds") {
+                                put("left", node.bounds.left + imagePadding)
+                                put("top", node.bounds.top + imagePadding)
+                                put("right", node.bounds.right + imagePadding)
+                                put("bottom", node.bounds.bottom + imagePadding)
+                            }
                             put("editable", node.editable)
                             put("focused", node.focused)
                             put("enabled", node.enabled)
@@ -959,13 +1203,17 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                 )
             },
             images = screenshot?.let { image ->
+                val bytes = annotatedScreenshot?.bytes ?: image.bytes
+                val mimeType = annotatedScreenshot?.mimeType ?: image.mimeType
+                val width = annotatedScreenshot?.width ?: image.width
+                val height = annotatedScreenshot?.height ?: image.height
                 listOf(
                     ChatImage(
-                        name = "device-observation-${value.id}.${if (image.mimeType == "image/png") "png" else "jpg"}",
-                        mimeType = image.mimeType,
-                        bytes = image.bytes,
-                        width = image.width,
-                        height = image.height,
+                        name = "device-observation-${value.id}.${if (mimeType == "image/png") "png" else "jpg"}",
+                        mimeType = mimeType,
+                        bytes = bytes,
+                        width = width,
+                        height = height,
                     )
                 )
             }.orEmpty(),
@@ -994,6 +1242,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
     override suspend fun finish(context: ToolExecutionContext) {
         val sessions =
             sessionGate.withLock { sessionsByRun.remove(context.runId)?.toList().orEmpty() }
+        coordinateGate.withLock { sessions.forEach(coordinatesBySession::remove) }
         sessions.forEach { id -> runCatching { gateway.closeSession(id) } }
     }
 
@@ -1010,6 +1259,52 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                 if (sessions.isEmpty()) sessionsByRun.remove(runId)
             }
         }
+        coordinateGate.withLock { coordinatesBySession.remove(sessionId) }
+    }
+
+    private suspend fun rememberCoordinateObservation(
+        sessionId: String,
+        observation: ModelCoordinateObservation?,
+    ) {
+        coordinateGate.withLock {
+            if (observation == null) coordinatesBySession.remove(sessionId)
+            else coordinatesBySession[sessionId] = observation
+        }
+    }
+
+    private suspend fun requireCoordinateObservation(
+        sessionId: String,
+        observationId: String,
+    ): ModelCoordinateObservation {
+        val observation = coordinateGate.withLock { coordinatesBySession[sessionId] }
+        require(observation?.observationId == observationId) {
+            localizedText(
+                "坐标识别结果已失效或不包含可换算的截图，请重新调用 device_observe",
+                "The coordinate observation has expired or has no convertible screenshot. Call device_observe again.",
+            )
+        }
+        return observation
+    }
+
+    private suspend fun coordinateObservationOrNull(sessionId: String): ModelCoordinateObservation? =
+        coordinateGate.withLock { coordinatesBySession[sessionId] }
+
+    private suspend fun clearCoordinateObservation(sessionId: String, observationId: String) {
+        coordinateGate.withLock {
+            if (coordinatesBySession[sessionId]?.observationId == observationId) {
+                coordinatesBySession.remove(sessionId)
+            }
+        }
+    }
+
+    private fun targetBox(value: JsonObject): ImageTargetBox? {
+        val box = value["target_box"]?.jsonObject ?: return null
+        return ImageTargetBox(
+            left = int(box, "left"),
+            top = int(box, "top"),
+            right = int(box, "right"),
+            bottom = int(box, "bottom"),
+        )
     }
 
     private fun required(args: JsonObject, name: String) =
@@ -1034,6 +1329,9 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
     private class BatchStepFailure(message: String) : IllegalStateException(message)
 
     private companion object {
+        val COORDINATE_ACTIONS = setOf("tap", "long_press", "swipe")
+        val BATCH_COORDINATE_ACTIONS = setOf("tap", "long_press", "swipe", "gesture")
+
         val BATCH_ACTIONS = setOf(
             "click", "long_click", "scroll", "input_text", "tap", "long_press", "swipe", "gesture",
             "back", "enter", "home", "recents", "escape", "delete", "tab",
@@ -1061,8 +1359,11 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                       "match_mode":{"type":"string","enum":["contains","exact"],"default":"contains"},
                       "match_index":{"type":"integer","minimum":0,"maximum":199,"description":localizedText("匹配多个节点时按从上到下、从左到右的序号", "Index among multiple matches ordered top-to-bottom, then left-to-right")},
                       "scroll_direction":{"type":"string","enum":["forward","backward","up","down","left","right"]},
-                      "x":{"type":"integer"},"y":{"type":"integer"},
-                      "end_x":{"type":"integer"},"end_y":{"type":"integer"},
+                      "x":{"type":"integer","description":localizedText("包含黑边的完整截图像素横坐标", "Full screenshot pixel X coordinate including the black border")},
+                      "y":{"type":"integer","description":localizedText("包含黑边的完整截图像素纵坐标", "Full screenshot pixel Y coordinate including the black border")},
+                      "target_box":{"type":"object","description":localizedText("tap 或 long_press 优先提供目标在完整截图中的边界框，App 点击其中心", "For tap or long_press, preferably provide the target bounding box in full-image pixels; the app taps its center"),"properties":{"left":{"type":"integer"},"top":{"type":"integer"},"right":{"type":"integer"},"bottom":{"type":"integer"}},"required":["left","top","right","bottom"],"additionalProperties":false},
+                      "end_x":{"type":"integer","description":localizedText("滑动终点在包含黑边的完整截图中的横坐标", "Swipe endpoint X coordinate in the full screenshot including the black border")},
+                      "end_y":{"type":"integer","description":localizedText("滑动终点在包含黑边的完整截图中的纵坐标", "Swipe endpoint Y coordinate in the full screenshot including the black border")},
                       "duration_ms":{"type":"integer","minimum":0,"maximum":10000},
                       "settle_ms":{"type":"integer","minimum":0,"maximum":1500,"description":localizedText("动作后在本地等待界面稳定的时间", "Local delay after the action for the screen to settle")},
                       "text":{"type":"string","maxLength":500,"description":localizedText("仅 input_text 使用", "Used only by input_text")},
@@ -1071,7 +1372,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                       "state":{"type":"string","enum":["present","absent"],"default":"present"},
                       "timeout_ms":{"type":"integer","minimum":0,"maximum":10000,"default":5000},
                       "interval_ms":{"type":"integer","minimum":150,"maximum":2000,"default":300},
-                      "strokes":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"points":{"type":"array","minItems":2,"maxItems":500,"items":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"],"additionalProperties":false}},"start_time_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"duration_ms":{"type":"integer","minimum":1,"maximum":10000}},"required":["points","duration_ms"],"additionalProperties":false}}
+                      "strokes":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"points":{"type":"array","minItems":2,"maxItems":500,"items":{"type":"object","properties":{"x":{"type":"integer","description":localizedText("包含黑边的完整截图像素横坐标", "Full screenshot pixel X coordinate including the black border")},"y":{"type":"integer","description":localizedText("包含黑边的完整截图像素纵坐标", "Full screenshot pixel Y coordinate including the black border")}},"required":["x","y"],"additionalProperties":false}},"start_time_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"duration_ms":{"type":"integer","minimum":1,"maximum":10000}},"required":["points","duration_ms"],"additionalProperties":false}}
                     },
                     "required":["action"],
                     "additionalProperties":false
