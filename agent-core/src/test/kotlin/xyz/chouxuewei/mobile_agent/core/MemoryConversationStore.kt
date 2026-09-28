@@ -54,6 +54,17 @@ internal class MemoryConversationStore : ConversationStore {
         if(rejectPublication || history.filter { it.sequence<=snapshot.boundary }.associate { it.id to it.version }!=snapshot.sourceVersions) return false
         saved=snapshot; return true
     }
+    val toolCallsById = linkedMapOf<String,ToolCallRecord>()
+    override suspend fun toolCalls(conversationId: String) =
+        toolCallsById.values.filter { it.conversationId==conversationId }.toList()
+    override suspend fun toolCall(id: String) = toolCallsById[id]
+    override suspend fun saveToolCall(call: ToolCallRecord) { toolCallsById[call.id]=call }
+    override suspend fun updateToolCall(call: ToolCallRecord) { toolCallsById[call.id]=call }
+    override suspend fun expireToolResults(toolIds: Set<String>,replacement: String) {
+        toolCallsById.replaceAll { _,call ->
+            if(call.toolId in toolIds) call.copy(result=replacement) else call
+        }
+    }
     fun add(role: MessageRole,text: String): Message {
         val next=(history.maxOfOrNull { it.sequence } ?: 0)+1
         return Message("m$next","c",next,role,text,MessageStatus.COMPLETE,1).also { history.add(it) }

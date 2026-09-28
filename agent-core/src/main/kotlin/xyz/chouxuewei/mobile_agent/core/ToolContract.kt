@@ -108,6 +108,13 @@ data class ToolResult(
     val isError: Boolean = false,
     /** 仅随当前模型请求传递，不写入工具记录，避免截图以 Base64 形式长期落库。 */
     val images: List<ChatImage> = emptyList(),
+    /**
+     * 模型在发起本步时申报的目的（工具参数中的步骤说明）。
+     * 只用于运行时的步骤记录，不参与结果内容，避免把动作参数当作用户可见文案。
+     */
+    val stepIntent: String? = null,
+    /** 模型对上一轮结果的说明：这一步完成了什么、确认了什么、收集到哪些关键信息。 */
+    val stepOutcome: String? = null,
 )
 
 interface ToolProvider {

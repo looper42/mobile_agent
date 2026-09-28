@@ -37,23 +37,98 @@ private val TOOL_IMAGE_MARKER: String
     )
 private val ACTIVE_COMPACTION_MARKER: String
     get() = localizedText("[较早执行步骤已自动压缩", "[Earlier execution steps were compressed automatically")
+/** 单步结果失效占位符的稳定前缀；文案随语言变化，识别只看前缀。 */
+private const val SINGLE_STEP_RESULT_MARKER = "{\"expired\":true"
+
 private val SINGLE_STEP_RESULT_PLACEHOLDER: String
     get() {
         val message = localizedText(
-            "界面识别结果仅在紧接着的一次模型决策中有效；节点和图片已自动清除，需要继续操作时请重新识别界面。",
-            "A screen observation is valid only for the immediately following model decision. Its nodes and image were cleared; inspect the screen again before continuing.",
+            "这一步看到的界面内容已经过期，关键信息已经记入任务记录；继续操作前需要重新看一次屏幕。",
+            "The screen details from this step have expired and the key information was added to the task record. Look at the screen again before the next action.",
         )
-        return "{\"expired\":true,\"message\":\"$message\"}"
+        return "$SINGLE_STEP_RESULT_MARKER,\"message\":\"$message\"}"
     }
 
 private fun isSingleStepResultPlaceholder(value: String): Boolean =
-    value == "{\"expired\":true,\"message\":\"界面识别结果仅在紧接着的一次模型决策中有效；节点和图片已自动清除，需要继续操作时请重新识别界面。\"}" ||
-        value == "{\"expired\":true,\"message\":\"A screen observation is valid only for the immediately following model decision. Its nodes and image were cleared; inspect the screen again before continuing.\"}"
+    value.startsWith(SINGLE_STEP_RESULT_MARKER)
 
 private data class RequestPreferences(
     val reasoningEffort: String?,
     val modelProfileId: String?,
 )
+
+/** 任务记录保留的步骤数、单条目的与结果的最大字符数；记录随每次请求发送，必须保持短小。 */
+private const val TASK_RECORD_MAX_STEPS = 12
+private const val TASK_RECORD_INTENT_CHARS = 60
+private const val TASK_RECORD_OUTCOME_CHARS = 140
+
+/** 步骤卡片上展示的收获长度；界面按一行呈现，过长会挤占阅读空间。 */
+private const val STEP_CARD_OUTCOME_CHARS = 120
+
+/** 只有设备步骤的收获会写回卡片；收获描述的是设备界面上的状态，其他工具没有这种状态。 */
+private const val DEVICE_TOOL_PREFIX = "device_"
+
+/**
+ * 一次 Run 的任务记录：模型每步申报的目的，以及下一步申报的该步收获。
+ *
+ * 界面节点和截图只对紧接着的一次决策有效，随后会被清理；这份记录跨步骤保留，让模型不必
+ * 每一步都从单张截图重新判断自己做到哪里了。记录只保存模型自己申报的文字和步骤状态，
+ * 不做任何推断，也不会出现在用户界面上。
+ */
+private class TaskRecord {
+    private class Entry(
+        val index: Int,
+        val intent: String,
+        var outcome: String? = null,
+        val unfinished: Boolean,
+    )
+
+    private val entries = ArrayDeque<Entry>()
+    private var steps = 0
+
+    /**
+     * 本轮工具结果申报的收获属于上一步；本轮没有上一步时忽略这条收获。
+     * 同一步里多个工具各自申报时取第一条非空内容，避免把同一个界面重复写进记录。
+     */
+    fun record(intents: List<String>, outcome: String?, unfinished: Boolean, fallbackIntent: String) {
+        if (entries.isNotEmpty()) {
+            val previous = entries.last()
+            if (previous.outcome.isNullOrBlank() && !outcome.isNullOrBlank()) previous.outcome = outcome
+        }
+        steps++
+        entries += Entry(steps, intents.firstOrNull(String::isNotBlank) ?: fallbackIntent, unfinished = unfinished)
+        while (entries.size > TASK_RECORD_MAX_STEPS) entries.removeFirst()
+    }
+
+    fun render(): String? {
+        if (entries.isEmpty()) return null
+        // 模型没有申报结果时不必逐条标注，避免把没有结果的普通工具调用写成一串抱怨。
+        val reported = entries.any { !it.outcome.isNullOrBlank() }
+        return buildString {
+            append(localizedText("[任务记录｜应用自动维护，不是用户的新要求]\n", "[Task record | maintained by the app, not a new user request]\n"))
+            append(localizedText("本次任务已执行 $steps 步。\n", "This task has run $steps steps.\n"))
+            if (steps > entries.size) {
+                append(localizedText("更早的 ${steps - entries.size} 步不再列出。\n", "${steps - entries.size} earlier steps are no longer listed.\n"))
+            }
+            entries.forEachIndexed { position, entry ->
+                append(entry.index).append(". ").append(oneLine(entry.intent, TASK_RECORD_INTENT_CHARS))
+                if (entry.unfinished) append(localizedText("（未成功）", " (not successful)"))
+                val outcome = entry.outcome
+                when {
+                    !outcome.isNullOrBlank() -> append(" → ").append(oneLine(outcome, TASK_RECORD_OUTCOME_CHARS))
+                    reported && position != entries.lastIndex ->
+                        append(localizedText(" →（这一步没有说明结果）", " → (no outcome was reported for this step)"))
+                }
+                append('\n')
+            }
+        }
+    }
+
+    private fun oneLine(value: String, limit: Int): String =
+        value.replace(WHITESPACE, " ").trim().take(limit)
+}
+
+private val WHITESPACE = Regex("\\s+")
 
 /** Application 拥有此运行时；页面、主题以及 Activity 重建都不拥有请求的生命周期。 */
 class ChatRuntime(
@@ -239,6 +314,11 @@ class ChatRuntime(
                 )).toMutableList()
                 workingTurnsForCleanup = workingTurns
                 val activeBaseTurnCount = workingTurns.size
+                val baseSystemPrompt = workingTurns.firstOrNull()
+                    ?.takeIf { it.role == "system" }
+                    ?.content
+                val taskRecord = TaskRecord()
+                var pendingOutcomeRecordId: String? = null
                 var contextWasCompacted = false
                 var toolRound = 0
                 var askedUserThisRun = false
@@ -248,6 +328,7 @@ class ChatRuntime(
                     } else {
                         definitions
                     }
+                    applyTaskRecord(workingTurns, baseSystemPrompt, taskRecord)
                     check(!hasStepLimit || toolRound <= maxSteps) {
                         localizedText("已达到单轮最大步骤（$maxSteps），可在设置中调整后重试", "The maximum steps for one run ($maxSteps) was reached. Adjust it in Settings and try again.")
                     }
@@ -349,6 +430,10 @@ class ChatRuntime(
                     flushReply(activeRun, close = false)
                     workingTurns += ChatTurn("assistant", step.text.toString(), requestedCalls)
                     val toolImages = mutableListOf<ChatImage>()
+                    val stepIntents = mutableListOf<String>()
+                    var stepOutcome: String? = null
+                    var stepUnfinished = false
+                    var lastDeviceRecordId: String? = null
                     for ((requested, recordId) in requestedRecords) {
                         val callDefinitions = if (askedUserThisRun && requested.toolId == "ask_user") {
                             requestDefinitions.filterNot { it.id == "ask_user" }
@@ -365,6 +450,13 @@ class ChatRuntime(
                         if (requested.toolId == "ask_user" && callDefinitions.any { it.id == "ask_user" }) {
                             askedUserThisRun = true
                         }
+                        result.stepIntent?.let(stepIntents::add)
+                        if (stepOutcome.isNullOrBlank()) stepOutcome = result.stepOutcome
+                        if (result.isError) stepUnfinished = true
+                        // 收获描述的是本步中最后一个设备动作之后的界面状态，因此回填给这个设备步骤。
+                        if (!result.isError && requested.toolId.startsWith(DEVICE_TOOL_PREFIX)) {
+                            lastDeviceRecordId = recordId
+                        }
                         workingTurns += ChatTurn(
                             role = "tool",
                             content = result.content,
@@ -377,6 +469,26 @@ class ChatRuntime(
                         }
                         toolImages += result.images
                     }
+                    taskRecord.record(
+                        intents = stepIntents,
+                        outcome = stepOutcome,
+                        unfinished = stepUnfinished,
+                        // 模型没写步骤说明时用工具名兜底，记录里每一步都能被认出来。
+                        fallbackIntent = requestedRecords.joinToString(", ") { (requested, _) ->
+                            requestDefinitions.firstOrNull { it.id == requested.toolId }?.title
+                                ?: requested.toolId
+                        },
+                    )
+                    // 本轮申报的收获属于上一步：写回那一步的卡片，让界面显示这一步实际完成了什么。
+                    val reportedOutcome = stepOutcome
+                    pendingOutcomeRecordId?.let { target ->
+                        if (!reportedOutcome.isNullOrBlank()) {
+                            runBoundedCleanup("step_outcome record=$target") {
+                                publishStepOutcome(target, reportedOutcome)
+                            }
+                        }
+                    }
+                    pendingOutcomeRecordId = lastDeviceRecordId
                     if (toolImages.isNotEmpty()) {
                         // 单步识别图只用于紧接着的一次模型决策；上一步图片在该决策结束时已经清除。
                         workingTurns.removeAll { turn ->
@@ -651,6 +763,36 @@ class ChatRuntime(
             inlineLimit = if (result.images.isEmpty()) MAX_INLINE_TOOL_RESULT_BYTES else 48_000,
             excerptLimit = if (result.images.isEmpty()) TOOL_RESULT_EXCERPT_BYTES else 40_000,
         ))
+    }
+
+    /**
+     * 把模型申报的收获写回它描述的那一步：步骤卡片因此显示这一步实际完成了什么，
+     * 而不是“手机操作已完成”这类没有信息的结果。只更新执行成功的记录，失败和未授权的
+     * 卡片继续显示用户需要处理的原因。
+     */
+    private suspend fun publishStepOutcome(recordId: String, outcome: String) {
+        val detail = outcome.replace(WHITESPACE, " ").trim().take(STEP_CARD_OUTCOME_CHARS)
+        if (detail.isEmpty()) return
+        val record = store.toolCall(recordId) ?: return
+        if (record.displaySummary == detail) return
+        store.updateToolCall(record.copy(displaySummary = detail, updatedAt = System.currentTimeMillis()))
+    }
+
+    /**
+     * 把最新的任务记录附在系统提示之后：记录跟着每一步更新，不属于用户消息，也不会被
+     * 单步结果过期或工具循环内的压缩清理掉。记录为空时保持原样。
+     */
+    private fun applyTaskRecord(
+        turns: MutableList<ChatTurn>,
+        baseSystemPrompt: String?,
+        record: TaskRecord,
+    ) {
+        if (baseSystemPrompt == null || turns.firstOrNull()?.role != "system") return
+        val rendered = record.render()
+        turns[0] = ChatTurn(
+            "system",
+            if (rendered == null) baseSystemPrompt else "$baseSystemPrompt\n\n$rendered",
+        )
     }
 
     /**

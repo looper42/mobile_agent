@@ -41,15 +41,45 @@ internal fun deviceToolSchema(schema: String): String {
                 ),
             )
         })
+        put("step_result", buildJsonObject {
+            put("type", "string")
+            put("minLength", 1)
+            put("maxLength", 240)
+            put(
+                "description",
+                localizedText(
+                    "上一次工具返回后你确认到的事实：这一步完成了什么、看到了什么、收集到哪些关键内容，例如界面名称、屏幕上的文字或数字、关键元素、出现的提示或异常。不要只写“成功”“完成”这类没有信息的话，也不要把打算做的事写在这里，更不要记录密码、验证码、账号或其他敏感信息；本轮第一个步骤没有上一步结果时写“无”",
+                    "The facts you confirmed from the previous tool result: what this step accomplished, what you saw, and the key details you collected, such as the screen name, on-screen text or numbers, important elements, and any prompt or error. Do not write empty phrases such as success or done, do not write what you plan to do, and never record passwords, verification codes, accounts, or other sensitive information. Write none when this is the first step of the run",
+                ),
+            )
+        })
     }
     val required = root["required"]?.jsonArray.orEmpty().toMutableList().apply {
         if (none { it.jsonPrimitive.contentOrNull == "step_summary" }) add(JsonPrimitive("step_summary"))
+        if (none { it.jsonPrimitive.contentOrNull == "step_result" }) add(JsonPrimitive("step_result"))
     }
     return JsonObject(root.toMutableMap().apply {
         put("properties", JsonObject(properties))
         put("required", JsonArray(required))
     }).toString()
 }
+
+private data class DeclaredStep(val intent: String?, val outcome: String?)
+
+private val NO_STEP_OUTCOME = setOf("无", "无结果", "none", "n/a", "na", "-")
+
+/**
+ * 只读取模型申报的步骤说明字段，其他参数一概不参与；参数不完整或字段缺失按未申报处理，
+ * 不能因为缺少这两个字段而让一次已经发起的调用失败。
+ */
+private fun declaredStep(argumentsJson: String): DeclaredStep = runCatching {
+    val args = TOOL_JSON.parseToJsonElement(argumentsJson.ifBlank { "{}" }).jsonObject
+    DeclaredStep(
+        intent = args["step_summary"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf(String::isNotEmpty),
+        outcome = args["step_result"]?.jsonPrimitive?.contentOrNull?.trim()
+            ?.takeIf { it.isNotEmpty() && it.lowercase() !in NO_STEP_OUTCOME },
+    )
+}.getOrElse { DeclaredStep(null, null) }
 
 class DeviceToolProvider internal constructor(
     private val gateway: DeviceGateway,
@@ -169,11 +199,15 @@ class DeviceToolProvider internal constructor(
     override suspend fun execute(
         call: RequestedToolCall,
         context: ToolExecutionContext
-    ): ToolResult = toolResult {
-        val args = call.arguments()
-        val handler = handlers[call.toolId]
-            ?: error(localizedText("设备工具不支持 ${call.toolId}", "Device tools do not support ${call.toolId}"))
-        handler.execute(args, context)
+    ): ToolResult {
+        // 先做一次宽松解析：步骤记录依赖模型申报的目的与收获，失败路径也要保留它们。
+        val declared = declaredStep(call.argumentsJson)
+        return toolResult {
+            val args = call.arguments()
+            val handler = handlers[call.toolId]
+                ?: error(localizedText("设备工具不支持 ${call.toolId}", "Device tools do not support ${call.toolId}"))
+            handler.execute(args, context)
+        }.copy(stepIntent = declared.intent, stepOutcome = declared.outcome)
     }
 
     override fun approvalSummary(call: RequestedToolCall): String? = runCatching {
@@ -1138,8 +1172,8 @@ class DeviceToolProvider internal constructor(
                     put(
                         "instruction",
                         localizedText(
-                            "在确定目标坐标前，必须以图片黑边上的坐标为基准进行尽量准确的估算。所有坐标都必须使用包含黑边的完整截图像素坐标，并包含黑边偏移；App 会在本地换算为屏幕坐标。tap 和 long_press 优先返回目标完整可触控区域的 target_box，由 App 点击其中心。",
-                            "Before determining target coordinates, you must use the coordinates on the image's black border as the reference and estimate the target position as accurately as possible. All coordinates must use full screenshot pixels including the black-border offset; the app converts them to screen coordinates locally. For tap and long_press, prefer the full touchable target_box so the app can tap its center.",
+                            "在确定目标坐标前，必须以图片黑边上的坐标为基准进行尽量准确的估算，黑边上的标尺是绝对准确的。tap 和 long_press 优先返回目标完整可触控区域的 target_box，由 App 点击其中心。",
+                            "Before determining target coordinates, you must use the coordinates on the image's black border as the reference and estimate the target position as accurately as possible,the ruler on the black border is absolutely accurate.  For tap and long_press, prefer the full touchable target_box so the app can tap its center.",
                         ),
                     )
                     if (screenshot != null && modelImageWidth != null && modelImageHeight != null) {
