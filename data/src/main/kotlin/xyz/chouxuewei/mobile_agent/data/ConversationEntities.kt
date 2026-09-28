@@ -31,6 +31,30 @@ internal data class MessageEntity(
     val reasoningDurationMillis: Long?,
 )
 
+/**
+ * A deliberately narrow FTS mirror. Large attachment/reasoning/tool payloads are excluded so
+ * history lookup remains bounded by the searchable text instead of the full message record.
+ */
+@Fts4(tokenizer = FtsOptions.TOKENIZER_UNICODE61)
+@Entity(tableName = "message_search")
+internal data class MessageSearchEntity(
+    @PrimaryKey @ColumnInfo(name = "rowid") val rowId: Long,
+    val messageId: String,
+    val conversationId: String,
+    val conversationTitle: String,
+    val role: String,
+    val text: String,
+)
+
+internal data class HistoryMessageMatchProjection(
+    val messageId: String,
+    val conversationId: String,
+    val conversationTitle: String,
+    val role: String,
+    val snippet: String,
+    val createdAt: Long,
+)
+
 @Entity(tableName = "runs", indices = [Index("conversationId")], foreignKeys = [ForeignKey(entity = ConversationEntity::class, parentColumns = ["id"], childColumns = ["conversationId"], onDelete = ForeignKey.CASCADE)])
 internal data class RunEntity(@PrimaryKey val id: String, val conversationId: String, val triggerMessageId: String, val replyMessageId: String, val status: String, val model: String, val startedAt: Long, val finishedAt: Long?, val error: String?)
 
@@ -70,8 +94,36 @@ internal interface ConversationDao {
     @Query("DELETE FROM conversations WHERE id=:id") suspend fun deleteConversation(id: String): Int
     @Query("SELECT * FROM messages WHERE conversationId=:id ORDER BY sequence") fun observeMessages(id: String): Flow<List<MessageEntity>>
     @Query("SELECT * FROM messages WHERE conversationId=:id ORDER BY sequence") suspend fun messages(id: String): List<MessageEntity>
-    @Query("SELECT * FROM messages WHERE (:conversationId IS NULL OR conversationId=:conversationId) AND status NOT IN ('QUEUED','GENERATING') ORDER BY createdAt DESC LIMIT 1000")
-    suspend fun searchableMessages(conversationId: String?): List<MessageEntity>
+    @Query("SELECT MAX(sequence) FROM messages WHERE conversationId=:conversationId")
+    suspend fun maxSequence(conversationId: String): Long?
+    @Query("SELECT * FROM messages WHERE id=:messageId LIMIT 1")
+    suspend fun messageById(messageId: String): MessageEntity?
+    @Query("SELECT * FROM messages WHERE conversationId=:conversationId AND status='QUEUED' ORDER BY sequence LIMIT 1")
+    suspend fun firstQueuedMessage(conversationId: String): MessageEntity?
+    @Query("SELECT EXISTS(SELECT 1 FROM messages WHERE conversationId=:conversationId AND status='QUEUED' LIMIT 1)")
+    suspend fun hasQueuedMessage(conversationId: String): Boolean
+    @Query("SELECT * FROM messages WHERE conversationId=:conversationId AND sequence<=:boundary ORDER BY sequence")
+    suspend fun messagesThrough(conversationId: String, boundary: Long): List<MessageEntity>
+    @Query(
+        """
+        SELECT search.messageId, search.conversationId, search.conversationTitle, search.role,
+               snippet(message_search, '[', ']', '…', 4, 32) AS snippet, messages.createdAt
+        FROM message_search AS search
+        INNER JOIN messages ON messages.id=search.messageId
+        WHERE message_search MATCH :ftsQuery
+          AND (:conversationId IS NULL OR search.conversationId=:conversationId)
+          AND messages.status NOT IN ('QUEUED','GENERATING')
+        ORDER BY CASE WHEN instr(lower(messages.text), lower(:literalQuery)) > 0 THEN 0 ELSE 1 END,
+                 messages.createdAt DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun searchMessages(
+        ftsQuery: String,
+        literalQuery: String,
+        conversationId: String?,
+        limit: Int,
+    ): List<HistoryMessageMatchProjection>
     @Query("SELECT * FROM messages WHERE id IN (:ids)") suspend fun messagesByIds(ids: List<String>): List<MessageEntity>
     @Query("SELECT attachments FROM conversations") suspend fun conversationAttachmentJson(): List<String>
     @Query("SELECT attachments FROM messages") suspend fun messageAttachmentJson(): List<String>

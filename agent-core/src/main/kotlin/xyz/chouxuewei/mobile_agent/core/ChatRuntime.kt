@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
 
 data class ChatConnection(
     val gateway: ChatModelGateway,
@@ -28,7 +29,7 @@ data class ModelUsageRecord(
 
 private const val MAX_INLINE_TOOL_RESULT_BYTES = 12_000
 private const val TOOL_RESULT_EXCERPT_BYTES = 8_000
-private const val MAX_INLINE_IMAGE_BYTES = 20L * 1024 * 1024
+private const val CLEANUP_TIMEOUT_MILLIS = 5_000L
 private val TOOL_IMAGE_MARKER: String
     get() = localizedText(
         "[设备识别图片，仅作为上一组工具结果",
@@ -67,6 +68,8 @@ class ChatRuntime(
     private val maxStepsPerRun: suspend () -> Int = { DEFAULT_SINGLE_RUN_MAX_STEPS },
 ) {
     private val gate = Mutex()
+    private val conversationGates = ConcurrentHashMap<String, Mutex>()
+    private val concurrencyLimiter = RunConcurrencyLimiter()
     private val jobs = mutableMapOf<String, Job>()
     private val preferencesByTrigger = mutableMapOf<String, RequestPreferences>()
     private val mutableActive = MutableStateFlow<Set<String>>(emptySet())
@@ -75,6 +78,8 @@ class ChatRuntime(
     val notices: StateFlow<Map<String, String>> = mutableNotices
     private val mutableContextUsage = MutableStateFlow<Map<String, ContextUsage>>(emptyMap())
     val contextUsage: StateFlow<Map<String, ContextUsage>> = mutableContextUsage
+    private val mutableStreamingReplies = MutableStateFlow<Map<String, StreamingReplySnapshot>>(emptyMap())
+    val streamingReplies: StateFlow<Map<String, StreamingReplySnapshot>> = mutableStreamingReplies
     private val approvalWaiters = mutableMapOf<String, CompletableDeferred<ToolApprovalDecision>>()
     private val mutableApprovals = MutableStateFlow<Map<String, ToolApprovalRequest>>(emptyMap())
     val approvals: StateFlow<Map<String, ToolApprovalRequest>> = mutableApprovals
@@ -98,12 +103,14 @@ class ChatRuntime(
             localizedText("请输入文字说明你想如何处理附件", "Describe how you want to handle the attachment.")
         }
         recovery.await()
-        gate.withLock {
+        conversationGates.computeIfAbsent(id) { Mutex() }.withLock {
             val trigger = store.enqueue(id, text.trim(), attachments)
-            // 队列中的消息绑定发送时的模型与思考强度，随后切换只影响新消息。
-            preferencesByTrigger[trigger.id] = RequestPreferences(reasoningEffort, modelProfileId)
-            // 被取消的协程仍可能正在落盘；等 finally 移除所有权后才可启动下一轮。
-            if (id !in jobs) startLocked(id)
+            gate.withLock {
+                // 队列中的消息绑定发送时的模型与思考强度，随后切换只影响新消息。
+                preferencesByTrigger[trigger.id] = RequestPreferences(reasoningEffort, modelProfileId)
+                // 全局锁内只登记内存状态，不执行 Room、模型或工具 I/O。
+                if (id !in jobs) startLocked(id)
+            }
         }
     }
 
@@ -113,25 +120,39 @@ class ChatRuntime(
         val job = scope.launch(start = CoroutineStart.LAZY) {
             var continueQueued = true
             try {
-                if (manual) {
-                    val c = connection(null)
-                    val definitions = enabledDefinitions()
-                    val turns = context.prepare(id, Long.MAX_VALUE, c.policy, c.model, c.gateway, manual = true,
-                        onStatus = { notice(id, it) }, tools = definitions)
-                    publishContextUsage(id, c.policy, c.modelProfileId, turns, definitions, compacted = true)
-                } else drain(id)
+                concurrencyLimiter.run {
+                    if (manual) {
+                        val c = connection(null)
+                        val definitions = enabledDefinitions()
+                        val turns = context.prepare(id, Long.MAX_VALUE, c.policy, c.model, c.gateway, manual = true,
+                            onStatus = { notice(id, it) }, tools = definitions)
+                        publishContextUsage(id, c.policy, c.modelProfileId, turns, definitions, compacted = true)
+                    } else drain(id)
+                }
             } catch (cancelled: CancellationException) {
                 notice(id, localizedText("已停止回复，已生成内容和对话记录均已保留", "Response stopped. Generated content and conversation history were preserved."))
             } catch (error: Exception) {
                 continueQueued = false
                 notice(id, userFacingMessage(error, localizedText("请求未完成，请重试", "The request was not completed. Please try again.")))
             } finally {
-                withContext(NonCancellable) {
+                var ownershipReleased = false
+                runBoundedCleanup("run_release conversation=$id") {
+                    // 与 send 共用每会话锁，避免“查队列为空”和“新消息入队”之间丢失唤醒。
+                    conversationGates.computeIfAbsent(id) { Mutex() }.withLock {
+                        val hasQueued = continueQueued && store.hasQueuedMessage(id)
+                        gate.withLock {
+                            jobs.remove(id)
+                            mutableActive.update { it - id }
+                            ownershipReleased = true
+                            if (hasQueued) startLocked(id)
+                        }
+                    }
+                }
+                if (!ownershipReleased) withContext(NonCancellable) {
+                    // 存储清理超时也必须释放运行槽；之后的 send 会重新唤醒该会话。
                     gate.withLock {
                         jobs.remove(id)
                         mutableActive.update { it - id }
-                        // 无论自然结束还是主动停止，已收下的补充消息都在安全边界继续处理。
-                        if (continueQueued && store.messages(id).any { it.status == MessageStatus.QUEUED }) startLocked(id)
                     }
                 }
             }
@@ -143,7 +164,7 @@ class ChatRuntime(
     private suspend fun drain(id: String) {
         while (true) {
             currentCoroutineContext().ensureActive()
-            val trigger = store.messages(id).firstOrNull { it.status == MessageStatus.QUEUED } ?: return
+            val trigger = store.firstQueuedMessage(id) ?: return
             val preferences = gate.withLock { preferencesByTrigger.remove(trigger.id) }
             val reasoningEffort = preferences?.reasoningEffort
             var run: Run? = null
@@ -151,9 +172,42 @@ class ChatRuntime(
             val assistantSteps = mutableListOf<StreamingAssistantStep>()
             var workingTurnsForCleanup: MutableList<ChatTurn>? = null
             val pendingSingleStepResults = linkedSetOf<String>()
+            var replyRevision = 0L
+            var checkpointWriter: ReplyCheckpointWriter? = null
             fun stepsSnapshot(now: Long = System.currentTimeMillis()) = assistantSteps.map { it.snapshot(now) }
             fun reasoningDuration(now: Long = System.currentTimeMillis()) =
                 stepsSnapshot(now).mapNotNull(AssistantStep::reasoningDurationMillis).sum().takeIf { it > 0L }
+            fun replySnapshot(activeRun: Run, now: Long = System.currentTimeMillis()) =
+                StreamingReplySnapshot(
+                    runId = activeRun.id,
+                    conversationId = activeRun.conversationId,
+                    replyMessageId = activeRun.replyMessageId,
+                    text = output.toString(),
+                    assistantSteps = stepsSnapshot(now),
+                    revision = ++replyRevision,
+                )
+            fun publishReply(activeRun: Run): StreamingReplySnapshot {
+                val snapshot = replySnapshot(activeRun)
+                mutableStreamingReplies.update { current -> current + (id to snapshot) }
+                checkpointWriter?.submit(snapshot)
+                return snapshot
+            }
+            suspend fun flushReply(activeRun: Run, close: Boolean) {
+                val writer = checkpointWriter ?: return
+                val snapshot = publishReply(activeRun)
+                val result = if (close) writer.closeAndFlush(snapshot) else writer.flush(snapshot)
+                if (close) checkpointWriter = null
+                result.exceptionOrNull()?.let { failure ->
+                    AgentLog.e("Runtime", failure) {
+                        "reply_checkpoint_flush_failed run=${activeRun.id} close=$close revision=${snapshot.revision}"
+                    }
+                }
+            }
+            fun clearStreamingReply(activeRun: Run) {
+                mutableStreamingReplies.update { current ->
+                    if (current[id]?.runId == activeRun.id) current - id else current
+                }
+            }
             try {
                 // 配置失败也要消费本次排队并保留失败记录，避免无限重试循环。
                 val startedRun = withContext(NonCancellable) { store.beginRun(id, trigger.id, localizedText("待连接", "Waiting to connect")) }
@@ -163,6 +217,9 @@ class ChatRuntime(
                 store.setRunModel(startedRun, c.model)
                 val activeRun = startedRun.copy(model = c.model)
                 run = activeRun
+                checkpointWriter = ReplyCheckpointWriter(scope) { snapshot ->
+                    store.updateReply(activeRun, snapshot.text, snapshot.assistantSteps)
+                }
                 val definitions = enabledDefinitions()
                 // 每轮开始时只读取一次，避免用户在执行中修改设置导致当前任务的上限突然变化。
                 val maxSteps = requireValidSingleRunMaxSteps(maxStepsPerRun())
@@ -209,11 +266,11 @@ class ChatRuntime(
                                     step.finishReasoning()
                                     step.text.append(event.text)
                                     output.append(event.text)
-                                    store.updateReply(activeRun, output.toString(), stepsSnapshot())
+                                    publishReply(activeRun)
                                 }
                                 is ModelEvent.ReasoningDelta -> {
                                     step.appendReasoning(event.text)
-                                    store.updateReply(activeRun, output.toString(), stepsSnapshot())
+                                    publishReply(activeRun)
                                 }
                                 is ModelEvent.ToolCall -> requestedCalls += event.call
                                 is ModelEvent.Error -> error(event.message)
@@ -260,7 +317,6 @@ class ChatRuntime(
                     step.finishReasoning()
                     check(finished) { localizedText("回复意外中断，已生成的内容已保留", "The response was interrupted. Generated content was preserved.") }
                     if (requestedCalls.isEmpty()) {
-                        store.updateReply(activeRun, output.toString(), stepsSnapshot())
                         if (finishReason == "length") notice(id, localizedText("本次回复已达到长度上限，你可以继续追问", "This response reached the length limit. You can ask a follow-up."))
                         break
                     }
@@ -277,7 +333,7 @@ class ChatRuntime(
                         requested to "${activeRun.id}:$toolRound:$index:${requested.id}"
                     }
                     step.toolCallIds += requestedRecords.map { it.second }
-                    store.updateReply(activeRun, output.toString(), stepsSnapshot())
+                    flushReply(activeRun, close = false)
                     workingTurns += ChatTurn("assistant", step.text.toString(), requestedCalls)
                     val toolImages = mutableListOf<ChatImage>()
                     for ((requested, recordId) in requestedRecords) {
@@ -303,11 +359,19 @@ class ChatRuntime(
                         val existingBytes = workingTurns.sumOf { turn ->
                             turn.images.sumOf { image -> image.bytes.size.toLong() }
                         }
-                        require(existingImages + toolImages.size <= 20) {
+                        require(existingImages + toolImages.size <= ChatImageLimits.MAX_COUNT) {
                             localizedText("当前模型请求中的设备截图过多，请结束本轮后继续", "This model request contains too many device screenshots. Finish this run before continuing.")
                         }
-                        require(existingBytes + toolImages.sumOf { it.bytes.size.toLong() } <= MAX_INLINE_IMAGE_BYTES) {
+                        require(existingBytes + toolImages.sumOf { it.bytes.size.toLong() } <= ChatImageLimits.MAX_TOTAL_BYTES) {
                             localizedText("当前模型请求中的设备截图总量过大，请结束本轮后继续", "Device screenshots in this model request are too large. Finish this run before continuing.")
+                        }
+                        val existingPixels = workingTurns.sumOf { turn ->
+                            turn.images.sumOf { image -> image.width.toLong() * image.height }
+                        }
+                        require(toolImages.all { image ->
+                            image.width.toLong() * image.height <= ChatImageLimits.MAX_SINGLE_PIXELS
+                        } && existingPixels + toolImages.sumOf { image -> image.width.toLong() * image.height } <= ChatImageLimits.MAX_TOTAL_PIXELS) {
+                            localizedText("当前模型请求中的设备截图像素总量过大", "Device screenshots in this model request contain too many pixels.")
                         }
                         // 多数兼容 Chat Completions 的服务只接受 user 角色携带图片；明确标记为工具数据，
                         // 防止模型把这条内部消息误当成用户追加的新指令。
@@ -318,6 +382,7 @@ class ChatRuntime(
                         )
                     }
                 }
+                withContext(NonCancellable) { flushReply(activeRun, close = true) }
                 check(output.isNotBlank()) { localizedText("模型没有返回正文，请检查回复预留和模型设置", "The model returned no response text. Check the output reserve and model settings.") }
                 store.finishRun(
                     activeRun,
@@ -326,6 +391,7 @@ class ChatRuntime(
                     reasoningDuration(),
                     RunStatus.SUCCEEDED,
                 )
+                clearStreamingReply(activeRun)
                 AgentLog.i("Runtime") {
                     "run_finish run=${activeRun.id} status=succeeded rounds=$toolRound output_chars=${output.length}"
                 }
@@ -333,6 +399,7 @@ class ChatRuntime(
                 AgentLog.w("Runtime", cancelled) { "run_finish run=${run?.id} status=cancelled" }
                 withContext(NonCancellable) {
                     run?.let {
+                        flushReply(it, close = true)
                         store.finishRun(
                             it,
                             output.toString(),
@@ -341,6 +408,7 @@ class ChatRuntime(
                             RunStatus.CANCELLED,
                             localizedText("用户已停止", "Stopped by user"),
                         )
+                        clearStreamingReply(it)
                     }
                 }
                 throw cancelled
@@ -348,28 +416,38 @@ class ChatRuntime(
                 AgentLog.e("Runtime", error) { "run_finish run=${run?.id} status=failed" }
                 val reason = userFacingMessage(error, localizedText("请求未完成，请重试", "The request was not completed. Please try again."))
                 run?.let {
-                    store.finishRun(
-                        it,
-                        output.toString(),
-                        stepsSnapshot(),
-                        reasoningDuration(),
-                        RunStatus.FAILED,
-                        reason,
-                    )
+                    withContext(NonCancellable) {
+                        flushReply(it, close = true)
+                        store.finishRun(
+                            it,
+                            output.toString(),
+                            stepsSnapshot(),
+                            reasoningDuration(),
+                            RunStatus.FAILED,
+                            reason,
+                        )
+                        clearStreamingReply(it)
+                    }
                 }
                 if (run == null) throw error
                 // 失败原因已经跟随消息展示，避免时间线再重复显示同一段错误。
                 mutableNotices.update { it - id }
             } finally {
+                run?.let { activeRun ->
+                    if (checkpointWriter != null) runBoundedCleanup("reply_checkpoint_close run=${activeRun.id}") {
+                        flushReply(activeRun, close = true)
+                    }
+                    clearStreamingReply(activeRun)
+                }
                 val cleanupTurns = workingTurnsForCleanup
                 if (cleanupTurns != null && pendingSingleStepResults.isNotEmpty()) {
-                    withContext(NonCancellable) {
+                    runBoundedCleanup("single_step_cleanup run=${run?.id}") {
                         expireSingleStepResults(cleanupTurns, pendingSingleStepResults)
                     }
                 }
                 run?.let { activeRun ->
                     // 工具资源只属于当前 Run；正常结束、失败和停止都执行同一条兜底清理路径。
-                    withContext(NonCancellable) {
+                    runBoundedCleanup("tool_provider_finish run=${activeRun.id}") {
                         tools?.finish(ToolExecutionContext(
                             activeRun.conversationId,
                             activeRun.id,
@@ -693,12 +771,24 @@ class ChatRuntime(
         return available.filter { accessByCapability.getValue(it.providerId).enabled }
     }
 
+    private suspend fun runBoundedCleanup(label: String, block: suspend () -> Unit): Boolean =
+        withContext(NonCancellable) {
+            try {
+                withTimeout(CLEANUP_TIMEOUT_MILLIS) { block() }
+                true
+            } catch (failure: Exception) {
+                AgentLog.w("Runtime", failure) { "cleanup_failed $label" }
+                false
+            }
+        }
+
     private suspend fun resolveImages(turns: List<ChatTurn>): List<ChatTurn> {
         val imageCount = turns.sumOf { turn -> turn.attachmentRefs.count(AttachmentRef::isImage) }
-        require(imageCount <= 20) { localizedText("当前对话中的图片过多，请新建对话或减少附件后重试", "This conversation contains too many images. Start a new conversation or remove attachments and try again.") }
+        require(imageCount <= ChatImageLimits.MAX_COUNT) { localizedText("当前对话中的图片过多，请新建对话或减少附件后重试", "This conversation contains too many images. Start a new conversation or remove attachments and try again.") }
         if (imageCount == 0) return turns
         val loader = requireNotNull(attachmentLoader) { localizedText("当前版本未配置图片读取能力", "Image reading is not configured in this version.") }
         var loadedBytes = 0L
+        var loadedPixels = 0L
         return turns.map { turn ->
             val refs = turn.attachmentRefs.filter(AttachmentRef::isImage)
             if (refs.isEmpty()) turn else turn.copy(images = refs.map { attachment ->
@@ -715,8 +805,16 @@ class ChatRuntime(
                     )
                 }
                 loadedBytes += image.bytes.size
-                require(loadedBytes <= MAX_INLINE_IMAGE_BYTES) {
+                require(loadedBytes <= ChatImageLimits.MAX_TOTAL_BYTES) {
                     localizedText("当前对话中的图片总量过大，请新建对话或减少附件后重试", "Images in this conversation are too large. Start a new conversation or remove attachments and try again.")
+                }
+                val pixels = image.width.toLong() * image.height
+                require(pixels in 1..ChatImageLimits.MAX_SINGLE_PIXELS) {
+                    localizedText("图片像素过大，请降低分辨率后重试", "The image resolution is too large. Reduce it and try again.")
+                }
+                loadedPixels += pixels
+                require(loadedPixels <= ChatImageLimits.MAX_TOTAL_PIXELS) {
+                    localizedText("当前对话中的图片像素总量过大，请减少图片后重试", "Images in this conversation contain too many pixels. Remove some images and try again.")
                 }
                 image
             })

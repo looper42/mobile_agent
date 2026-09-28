@@ -36,23 +36,28 @@ class RoomConversationStore internal constructor(private val database: AgentData
         reasoningEffort: String?,
     ) = dao.draft(id, text, encodeAttachments(attachments), reasoningEffort)
     override suspend fun messages(id: String) = dao.messages(id).map(MessageEntity::record)
+    override suspend fun messagesThrough(conversationId: String, boundary: Long) =
+        dao.messagesThrough(conversationId, boundary).map(MessageEntity::record)
+    override suspend fun messageById(messageId: String) = dao.messageById(messageId)?.record()
+    override suspend fun firstQueuedMessage(conversationId: String) = dao.firstQueuedMessage(conversationId)?.record()
+    override suspend fun hasQueuedMessage(conversationId: String) = dao.hasQueuedMessage(conversationId)
 
     override suspend fun enqueue(id: String, text: String, attachments: List<AttachmentRef>): Message = database.withTransaction {
         val c = requireNotNull(dao.conversation(id))
-        val history = dao.messages(id)
+        val lastSequence = dao.maxSequence(id)
         // 为回复预留相邻序号，即使多个补充已排队，回复仍位于对应用户消息之后。
-        val m = Message(UUID.randomUUID().toString(), id, (history.maxOfOrNull { it.sequence } ?: 0) + 2,
+        val m = Message(UUID.randomUUID().toString(), id, (lastSequence ?: 0) + 2,
             MessageRole.USER, text, MessageStatus.QUEUED, System.currentTimeMillis(), attachments)
         dao.save(m.entity())
         val firstTitle = text.take(28).ifBlank { if (attachments.any(AttachmentRef::isImage)) localizedText("图片对话", "Image conversation") else localizedText("新对话", "New conversation") }
         // 标题可能是在另一种系统语言下创建的，判断占位标题时同时兼容中英文旧数据。
-        dao.save(c.copy(title = if (history.isEmpty() && c.title in setOf("新对话", "New conversation")) firstTitle else c.title,
+        dao.save(c.copy(title = if (lastSequence == null && c.title in setOf("新对话", "New conversation")) firstTitle else c.title,
             draft = "", attachments = "[]", reasoningEffort = null, updatedAt = m.createdAt))
         m
     }
     override suspend fun beginRun(id: String, triggerId: String, model: String): Run = database.withTransaction {
         check(dao.activeCount(id) == 0) { localizedText("这段对话已有正在执行的回复", "This conversation already has a response in progress.") }
-        val trigger = dao.messages(id).first { it.id == triggerId }
+        val trigger = requireNotNull(dao.messageById(triggerId)).also { check(it.conversationId == id) }
         check(trigger.status == MessageStatus.QUEUED.name)
         dao.save(trigger.copy(status = MessageStatus.COMPLETE.name, version = trigger.version + 1))
         val now = System.currentTimeMillis()
@@ -103,7 +108,7 @@ class RoomConversationStore internal constructor(private val database: AgentData
     }
     override suspend fun snapshot(id: String) = dao.snapshot(id)?.record()
     override suspend fun publishSnapshot(snapshot: ContextSnapshot): Boolean = database.withTransaction {
-        val prefix = dao.messages(snapshot.conversationId).filter { it.sequence <= snapshot.boundary }
+        val prefix = dao.messagesThrough(snapshot.conversationId, snapshot.boundary)
         if (prefix.isEmpty() || prefix.any { it.status in listOf("QUEUED", "GENERATING") } ||
             prefix.associate { it.id to it.version } != snapshot.sourceVersions) return@withTransaction false
         if ((dao.snapshot(snapshot.conversationId)?.boundary ?: -1) > snapshot.boundary) return@withTransaction false
@@ -113,20 +118,23 @@ class RoomConversationStore internal constructor(private val database: AgentData
     override suspend fun searchMessages(query: String, conversationId: String?, limit: Int): List<HistoryMessageMatch> {
         val normalized = query.trim()
         if (normalized.isEmpty()) return emptyList()
-        val terms = normalized.split(Regex("[\\s，。！？、：;；]+"))
-            .filter { it.length >= 2 } + normalized.windowed(2).filter { it.all(Char::isLetterOrDigit) }
-        val titles = dao.conversations().associate { it.id to it.title }
-        return dao.searchableMessages(conversationId).map { entity ->
-            val score = (if (entity.text.contains(normalized, true)) 100 else 0) +
-                terms.count { entity.text.contains(it, true) }
-            entity to score
-        }.filter { it.second > 0 }
-            .sortedWith(compareByDescending<Pair<MessageEntity, Int>> { it.second }.thenByDescending { it.first.createdAt })
-            .take(limit.coerceIn(1, 20))
-            .map { (entity, _) -> HistoryMessageMatch(
-                entity.id, entity.conversationId, titles[entity.conversationId].orEmpty(),
-                MessageRole.valueOf(entity.role), entity.text, entity.createdAt,
-            ) }
+        val tokens = normalized.split(Regex("[^\\p{L}\\p{N}_]+"))
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+        if (tokens.isEmpty()) return emptyList()
+        val ftsQuery = tokens.joinToString(" AND ") { token ->
+            "\"${token.replace("\"", "\"\"")}\""
+        }
+        return dao.searchMessages(ftsQuery, normalized, conversationId, limit.coerceIn(1, 20)).map { match ->
+            HistoryMessageMatch(
+                match.messageId,
+                match.conversationId,
+                match.conversationTitle,
+                MessageRole.valueOf(match.role),
+                match.snippet,
+                match.createdAt,
+            )
+        }
     }
     override suspend fun messagesByIds(ids: List<String>) =
         if (ids.isEmpty()) emptyList() else dao.messagesByIds(ids.take(20)).map(MessageEntity::record)

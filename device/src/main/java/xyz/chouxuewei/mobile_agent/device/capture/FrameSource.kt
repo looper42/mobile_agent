@@ -21,7 +21,7 @@ internal class FrameSource : AutoCloseable {
     private val thread = HandlerThread("virtual-display-frames").apply { start() }
     private val reader = ImageReader.newInstance(
         DisplayAdapter.WIDTH, DisplayAdapter.HEIGHT, PixelFormat.RGBA_8888, 3
-    )
+    ).also { requireCapturePixels(DisplayAdapter.WIDTH, DisplayAdapter.HEIGHT) }
     private var lastFrame = 0L
     @Volatile private var closed = false
     @Volatile private var latest: Bitmap? = null
@@ -38,6 +38,9 @@ internal class FrameSource : AutoCloseable {
                 lastFrame = now
                 val plane = frame.planes[0]
                 val rowWidth = plane.rowStride / plane.pixelStride
+                if (rowWidth <= 0 || frame.height <= 0 ||
+                    rowWidth.toLong() * frame.height > MAX_CAPTURE_PIXELS
+                ) return@use
                 val padded = Bitmap.createBitmap(rowWidth, frame.height, Bitmap.Config.ARGB_8888)
                 padded.copyPixelsFromBuffer(plane.buffer)
                 val bitmap = Bitmap.createBitmap(padded, 0, 0, frame.width, frame.height)
@@ -62,7 +65,7 @@ internal class FrameSource : AutoCloseable {
                 Bitmap.createScaledBitmap(bitmap, maxWidth, targetHeight, true)
             } else bitmap
             try {
-                java.io.ByteArrayOutputStream().use { output ->
+                LimitedByteArrayOutputStream(MAX_PREVIEW_OUTPUT_BYTES).use { output ->
                     check(encodedBitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
                         localizedText("虚拟屏画面编码失败", "Virtual display frame encoding failed.")
                     }

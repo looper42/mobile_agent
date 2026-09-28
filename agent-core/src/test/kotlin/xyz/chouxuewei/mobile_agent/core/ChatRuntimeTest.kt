@@ -10,9 +10,16 @@ class ChatRuntimeTest {
         val memory=MemoryConversationStore()
         val finishing=CompletableDeferred<Unit>(); val release=CompletableDeferred<Unit>()
         val store=object : ConversationStore by memory {
-            override suspend fun finishRun(run: Run,text: String,status: RunStatus,error: String?) {
+            override suspend fun finishRun(
+                run: Run,
+                text: String,
+                assistantSteps: List<AssistantStep>,
+                reasoningDurationMillis: Long?,
+                status: RunStatus,
+                error: String?,
+            ) {
                 if(status==RunStatus.CANCELLED) { finishing.complete(Unit); release.await() }
-                memory.finishRun(run,text,status,error)
+                memory.finishRun(run,text,assistantSteps,reasoningDurationMillis,status,error)
             }
         }
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Unconfined)
@@ -23,7 +30,7 @@ class ChatRuntimeTest {
         } }
         val runtime=ChatRuntime(store,{ _ -> ChatConnection(gateway,ContextPolicy(8192,1024),"test") },scope)
         try {
-            runtime.send("c","开始",emptyList()); started.await(); runtime.stop("c"); finishing.await()
+            runtime.send("c","开始",emptyList()); withTimeout(3000) { started.await() }; runtime.stop("c"); withTimeout(3000) { finishing.await() }
             runtime.send("c","停止之后补充",emptyList())
             assertEquals(1,memory.runs.size)
             release.complete(Unit)

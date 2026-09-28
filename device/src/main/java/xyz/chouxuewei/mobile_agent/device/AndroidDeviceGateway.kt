@@ -13,7 +13,6 @@ import android.os.ParcelFileDescriptor
 import android.view.KeyEvent
 import android.view.WindowManager
 import com.topjohnwu.superuser.Shell
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +20,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import xyz.chouxuewei.mobile_agent.core.Action
@@ -45,6 +46,11 @@ import xyz.chouxuewei.mobile_agent.device.accessibility.AccessibilityScreenshotE
 import xyz.chouxuewei.mobile_agent.device.accessibility.AccessibilityWindowCapture
 import xyz.chouxuewei.mobile_agent.device.accessibility.AccessibilityWindowTarget
 import xyz.chouxuewei.mobile_agent.device.capture.FrameSource
+import xyz.chouxuewei.mobile_agent.device.capture.LimitedByteArrayOutputStream
+import xyz.chouxuewei.mobile_agent.device.capture.MAX_CAPTURE_INPUT_BYTES
+import xyz.chouxuewei.mobile_agent.device.capture.MAX_CAPTURE_OUTPUT_BYTES
+import xyz.chouxuewei.mobile_agent.device.capture.readBytesLimited
+import xyz.chouxuewei.mobile_agent.device.capture.requireCapturePixels
 import xyz.chouxuewei.mobile_agent.device.root.DisplayAdapter
 import xyz.chouxuewei.mobile_agent.device.root.RootBridge
 
@@ -96,6 +102,7 @@ class AndroidDeviceGateway(
     private val preferences = appContext.getSharedPreferences(ROOT_PREFERENCES, Context.MODE_PRIVATE)
     private val bridge = RootBridge(appContext)
     private val mutex = Mutex()
+    private val screenshotPermit = Semaphore(1)
     private var active: ActiveSession? = null
     private val mutableActiveMode = MutableStateFlow<ExecutionMode?>(null)
     val activeMode: StateFlow<ExecutionMode?> = mutableActiveMode
@@ -286,7 +293,11 @@ class AndroidDeviceGateway(
         try {
             var contentRevision = 0L
             val focusedWindow = if (current.session.mode == ExecutionMode.MAIN_DISPLAY) {
-                runCatching { captureFocusedWindowObservation(current, includeScreenshot) }
+                runCatching {
+                    if (includeScreenshot) screenshotPermit.withPermit {
+                        captureFocusedWindowObservation(current, includeScreenshot = true)
+                    } else captureFocusedWindowObservation(current, includeScreenshot = false)
+                }
                     .onFailure { error ->
                         AgentLog.w("Device", error) {
                             "focused_window_observation_failed display=${current.displayId}"
@@ -297,11 +308,11 @@ class AndroidDeviceGateway(
             val capturedObservation = focusedWindow ?: withoutMainDisplayOverlay(current) {
                 val captured = when {
                     includeScreenshot && current.session.mode == ExecutionMode.VIRTUAL_DISPLAY ->
-                        current.frames?.latestJpeg(SCREENSHOT_JPEG_QUALITY)?.let {
+                        screenshotPermit.withPermit { current.frames?.latestJpeg(SCREENSHOT_JPEG_QUALITY) }?.let {
                             contentRevision = it.revision
                             Screenshot(it.bytes, "image/jpeg", current.viewport.width, current.viewport.height)
                         }
-                    includeScreenshot -> captureMain().also {
+                    includeScreenshot -> screenshotPermit.withPermit { captureMain() }.also {
                         current.viewport = Viewport(it.width, it.height)
                         contentRevision = System.nanoTime()
                     }
@@ -629,6 +640,8 @@ class AndroidDeviceGateway(
         viewport: Viewport,
     ): Screenshot = withContext(Dispatchers.Default) {
         val source = capture.bitmap
+        requireCapturePixels(source.width, source.height)
+        requireCapturePixels(viewport.width, viewport.height)
         var composed: Bitmap? = null
         try {
             val outputBitmap = if (source.width == viewport.width && source.height == viewport.height) {
@@ -650,7 +663,7 @@ class AndroidDeviceGateway(
                     }
                 }
             }
-            val encoded = ByteArrayOutputStream().use { output ->
+            val encoded = LimitedByteArrayOutputStream(MAX_CAPTURE_OUTPUT_BYTES).use { output ->
                 check(outputBitmap.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_JPEG_QUALITY, output)) {
                     localizedText("窗口截图压缩失败", "Window screenshot compression failed.")
                 }
@@ -673,15 +686,21 @@ class AndroidDeviceGateway(
         return Viewport(metrics.widthPixels.coerceAtLeast(1), metrics.heightPixels.coerceAtLeast(1))
     }
 
-    private suspend fun captureMain(): Screenshot = withContext(Dispatchers.IO) {
-        val bytes = bridge.captureMain().use { descriptor ->
-            ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { it.readBytes() }
+    private suspend fun captureMain(): Screenshot {
+        val bytes = withContext(Dispatchers.IO) {
+            bridge.captureMain().use { descriptor ->
+                ParcelFileDescriptor.AutoCloseInputStream(descriptor).use {
+                    it.readBytesLimited(MAX_CAPTURE_INPUT_BYTES)
+                }
+            }
         }
+        return withContext(Dispatchers.Default) {
         val bitmap = checkNotNull(BitmapFactory.decodeByteArray(bytes, 0, bytes.size)) {
             localizedText("主屏截图数据无效", "Invalid main-screen screenshot data.")
         }
         try {
-            val encoded = ByteArrayOutputStream().use { output ->
+            requireCapturePixels(bitmap.width, bitmap.height)
+            val encoded = LimitedByteArrayOutputStream(MAX_CAPTURE_OUTPUT_BYTES).use { output ->
                 check(bitmap.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_JPEG_QUALITY, output)) {
                     localizedText("主屏截图压缩失败", "Main-screen screenshot compression failed.")
                 }
@@ -690,6 +709,7 @@ class AndroidDeviceGateway(
             Screenshot(encoded, "image/jpeg", bitmap.width, bitmap.height)
         } finally {
             bitmap.recycle()
+        }
         }
     }
 }

@@ -13,7 +13,7 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class ConversationMigrationTest {
-    @Test fun migrationPreservesTasksAndRestoresChatDraftPartialReplyAndSnapshot() = runBlocking {
+    @Test fun migrationRemovesLegacyAgentAndRestoresChatDraftPartialReplyAndSnapshot() = runBlocking {
         val context=InstrumentationRegistry.getInstrumentation().targetContext
         val name="migration-${UUID.randomUUID()}.db"
         val path=context.getDatabasePath(name); path.parentFile!!.mkdirs()
@@ -33,11 +33,14 @@ class ConversationMigrationTest {
                 TOOL_CALL_MIGRATION,
                 ARTIFACT_MIGRATION,
                 CONVERSATION_PIN_MIGRATION,
+                MESSAGE_SEARCH_MIGRATION,
+                REMOVE_LEGACY_AGENT_MIGRATION,
             ).build()
         var db=open()
         try {
-            assertEquals("保留旧任务",db.records().findTask("old-task")!!.instruction)
-            assertEquals("old-observation",db.records().steps("old-task").single().observationId)
+            db.openHelper.readableDatabase.query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('tasks','steps')",
+            ).use { assertFalse(it.moveToFirst()) }
             var store=RoomConversationStore(db)
             val c=store.createConversation()
             store.setPinned(c.id, true)
@@ -67,7 +70,9 @@ class ConversationMigrationTest {
             assertFalse(store.publishSnapshot(snap.copy(id="stale",sourceVersions=mapOf(m.id to 999))))
             assertEquals("s2",store.snapshot(c.id)!!.id)
             assertEquals(5,store.messages(c.id).size)
-            assertNotNull(db.records().findTask("old-task"))
+            db.openHelper.readableDatabase.query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='message_search'",
+            ).use { assertTrue(it.moveToFirst()) }
         } finally { db.close(); context.deleteDatabase(name) }
     }
 }

@@ -1,28 +1,21 @@
 package xyz.chouxuewei.mobile_agent.overlay
 
 import android.Manifest
-import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
-import android.graphics.BitmapFactory
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
 import android.provider.Settings
 import android.view.Gravity
-import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.ViewModelStore
@@ -34,13 +27,11 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
@@ -65,6 +56,7 @@ import xyz.chouxuewei.mobile_agent.core.ToolCallStatus
 import xyz.chouxuewei.mobile_agent.core.UserQuestionRequest
 import xyz.chouxuewei.mobile_agent.core.userFacingMessage
 import xyz.chouxuewei.mobile_agent.core.localizedText
+import xyz.chouxuewei.mobile_agent.core.withStreamingReply
 import xyz.chouxuewei.mobile_agent.data.ModelSettings
 import xyz.chouxuewei.mobile_agent.data.SpeechSettings
 import xyz.chouxuewei.mobile_agent.prototype.PrototypeApplication
@@ -84,11 +76,13 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var app: PrototypeApplication
-    private lateinit var windows: WindowManager
+    private lateinit var windowController: OverlayWindowController
+    private lateinit var notificationController: OverlayNotificationController
+    private lateinit var previewController: VirtualScreenPreviewController
     private val presentation = OverlayStateMachine()
-    private val viewState = MutableStateFlow(OverlayViewState())
-    private var overlay: ComposeView? = null
-    private var layout: WindowManager.LayoutParams? = null
+    private val stateStore = OverlayStateStore()
+    private val overlay get() = windowController.view
+    private val layout get() = windowController.layout
 
     // 进程若由常驻服务单独恢复，默认没有 Activity 在前台；MainActivity 启动后会立即改为 true。
     private var appVisible = false
@@ -171,8 +165,29 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         activeInstance = this
         appVisible = latestAppVisible
         app = application as PrototypeApplication
-        windows = getSystemService(WindowManager::class.java)
-        createNotificationChannels()
+        windowController = OverlayWindowController(this)
+        notificationController = OverlayNotificationController(
+            service = this,
+            sink = SystemOverlayNotificationSink(getSystemService(NotificationManager::class.java)),
+            notificationId = NOTIFICATION_ID,
+            normalChannelId = CHANNEL_ID,
+            interactionChannelId = INTERACTION_CHANNEL_ID,
+            openIntent = ::openConversationIntent,
+            stopIntent = { id -> Intent(this, DeviceOperationOverlayService::class.java).apply {
+                action = ACTION_STOP
+                putExtra(EXTRA_CONVERSATION_ID, id)
+            } },
+        )
+        previewController = VirtualScreenPreviewController(
+            scope = scope,
+            gateway = app.deviceGateway,
+            shouldSample = { overlay != null && presentation.presentation == OverlayPresentation.FULL_CHAT },
+            onPreview = { preview ->
+                virtualScreenPreview = preview
+                publishState()
+            },
+        )
+        notificationController.createChannels()
         updateForegroundType(microphone = false)
         collectRuntimeState()
         publishState()
@@ -298,52 +313,12 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         scope.launch {
             app.deviceGateway.activeMode.collectLatest { value ->
                 mode = value
-                virtualScreenPreview = null
+                previewController.setEnabled(value == ExecutionMode.VIRTUAL_DISPLAY)
                 scheduleIdleCollapse()
                 refreshOverlay()
                 refreshNotification()
                 stopIfUnused()
-                if (value == ExecutionMode.VIRTUAL_DISPLAY) {
-                    collectVirtualScreenPreview()
-                }
             }
-        }
-    }
-
-    /**
-     * 只有完整悬浮窗实际可见时才编码预览，摘要态和 App 前台不消耗持续的图片压缩资源。
-     * activeMode 使用 collectLatest；设备会话结束时这段循环会立即取消并清空旧帧。
-     */
-    private suspend fun collectVirtualScreenPreview() {
-        var revision = 0L
-        while (true) {
-            if (overlay != null && presentation.presentation == OverlayPresentation.FULL_CHAT) {
-                val frame = try {
-                    app.deviceGateway.latestVirtualDisplayPreview(revision)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    null
-                }
-                if (frame != null) {
-                    val preview = withContext(Dispatchers.Default) {
-                        BitmapFactory.decodeByteArray(frame.jpegBytes, 0, frame.jpegBytes.size)?.let { bitmap ->
-                            VirtualScreenPreview(
-                                revision = frame.revision,
-                                image = bitmap.asImageBitmap(),
-                                width = frame.width,
-                                height = frame.height,
-                            )
-                        }
-                    }
-                    revision = frame.revision
-                    if (preview != null) {
-                        virtualScreenPreview = preview
-                        publishState()
-                    }
-                }
-            }
-            delay(VIRTUAL_SCREEN_PREVIEW_INTERVAL_MILLIS)
         }
     }
 
@@ -389,11 +364,12 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             combine(
                 app.conversations.observeMessages(id),
                 app.conversations.observeToolCalls(id),
-            ) { currentMessages, currentCalls -> currentMessages to currentCalls }
-                .collectLatest { (currentMessages, currentCalls) ->
-                    messages = currentMessages
+                app.chatRuntime.streamingReplies,
+            ) { currentMessages, currentCalls, streaming -> Triple(currentMessages, currentCalls, streaming[id]) }
+                .collectLatest { (currentMessages, currentCalls, streaming) ->
+                    messages = currentMessages.withStreamingReply(streaming)
                     calls = currentCalls
-                    val assistant = currentMessages.lastOrNull { it.role == MessageRole.ASSISTANT }
+                    val assistant = messages.lastOrNull { it.role == MessageRole.ASSISTANT }
                     responseText = assistant?.assistantSteps
                         ?.map(AssistantStep::text)?.filter(String::isNotBlank)?.joinToString("\n\n")
                         ?.takeIf(String::isNotBlank)
@@ -401,7 +377,6 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
                     steps = currentCalls.filter { assistant == null || it.replyMessageId == assistant.id }
                         .takeLast(8).map { it.overlayStep(toolTitles) }
                     publishState()
-                    refreshNotification()
                 }
         }
     }
@@ -461,7 +436,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         val selected = conversationId
         val selectedConversation = conversations.firstOrNull { it.id == selected }
         val summary = summaryText(selectedConversation)
-        viewState.value = OverlayViewState(
+        stateStore.publish(OverlayViewState(
             presentation = presentation.presentation,
             theme = theme,
             selectedConversationId = selected,
@@ -483,7 +458,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             dockedAtStart = dockedEdge == DockEdge.LEFT,
             voiceInputState = voiceInputState,
             virtualScreenPreview = virtualScreenPreview,
-        )
+        ))
     }
 
     private fun summaryText(conversation: Conversation?): Pair<String, String> {
@@ -531,7 +506,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             setViewTreeSavedStateRegistryOwner(this@DeviceOperationOverlayService)
             setViewTreeViewModelStoreOwner(this@DeviceOperationOverlayService)
             setContent {
-                val state by viewState.collectAsState()
+                val state by stateStore.state.collectAsState()
                 OverlayContent(state, actions)
             }
         }
@@ -555,9 +530,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             } else initialY.coerceIn(bounds.top, (bounds.bottom - height).coerceAtLeast(bounds.top))
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
-        overlay = view
-        layout = params
-        windows.addView(view, params)
+        windowController.attach(view, params)
     }
 
     private fun applyPresentation(previous: OverlayPresentation, dockEdgeOverride: DockEdge? = null) {
@@ -588,7 +561,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             clampFullY(params.y, bounds, height)
         } else params.y.coerceIn(bounds.top, (bounds.bottom - height).coerceAtLeast(bounds.top))
         overlayY = params.y
-        windows.updateViewLayout(view, params)
+        windowController.update()
     }
 
     private fun desiredSize(bounds: Rect): Pair<Int, Int> = when (presentation.presentation) {
@@ -644,22 +617,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         else (bounds.right - width - margin).coerceAtLeast(bounds.left)
     }
 
-    private fun safeBounds(): Rect {
-        if (Build.VERSION.SDK_INT >= 30) {
-            val metrics = windows.currentWindowMetrics
-            val bounds = Rect(metrics.bounds)
-            val insets = metrics.windowInsets.getInsetsIgnoringVisibility(
-                WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
-            )
-            bounds.left += insets.left
-            bounds.top += insets.top
-            bounds.right -= insets.right
-            bounds.bottom -= insets.bottom
-            return bounds
-        }
-        @Suppress("DEPRECATION")
-        return Rect(0, 0, resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
-    }
+    private fun safeBounds(): Rect = windowController.safeBounds()
 
     @Suppress("DEPRECATION")
     private fun overlayWindowType(): Int = if (Build.VERSION.SDK_INT >= 26) {
@@ -716,7 +674,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             (bounds.bottom - params.height).coerceAtLeast(bounds.top),
         )
         overlayY = params.y
-        windows.updateViewLayout(view, params)
+        windowController.update()
     }
 
     private fun nearestDockEdge(): DockEdge {
@@ -738,7 +696,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         val view = overlay ?: return
         val params = layout ?: return
         params.x = edgeX(safeBounds(), params.width)
-        windows.updateViewLayout(view, params)
+        windowController.update()
     }
 
     private fun moveFullWindow(dx: Float, dy: Float, finished: Boolean) {
@@ -786,7 +744,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             resizeHint = nextHint
             publishState()
         }
-        windows.updateViewLayout(view, params)
+        windowController.update()
     }
 
     private fun resizeFullWindow(corner: ResizeCorner, dx: Float, dy: Float, finished: Boolean) {
@@ -836,7 +794,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
                 else -> null
             }
             publishState()
-            windows.updateViewLayout(view, params)
+            windowController.update()
             return
         }
 
@@ -919,22 +877,8 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         })
     }
 
-    private fun updateForegroundType(microphone: Boolean): Boolean = runCatching {
-        val currentNotification = notification()
-        when {
-            Build.VERSION.SDK_INT >= 34 -> {
-                val type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
-                    if (microphone) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
-                startForeground(NOTIFICATION_ID, currentNotification, type)
-            }
-            Build.VERSION.SDK_INT >= 29 && microphone -> startForeground(
-                NOTIFICATION_ID,
-                currentNotification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
-            )
-            else -> startForeground(NOTIFICATION_ID, currentNotification)
-        }
-    }.isSuccess
+    private fun updateForegroundType(microphone: Boolean): Boolean =
+        notificationController.startForeground(notificationState(), microphone)
 
     private fun stopOperation() {
         if (stopping) return
@@ -956,10 +900,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
     }
 
     private fun removeOverlay() {
-        layout?.let { overlayY = it.y }
-        overlay?.let { view -> runCatching { windows.removeView(view) } }
-        overlay = null
-        layout = null
+        windowController.detach()?.let { overlayY = it }
         fullDragSession = null
         resizeSession = null
         resizeHint = null
@@ -970,7 +911,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         if (!persistentOverlay && !hasWork() && !completionHold) stopSelf()
     }
 
-    private fun notification(): android.app.Notification {
+    private fun notificationState(): OverlayNotificationState {
         val approval = approvals.firstOrNull()
         val question = questions.firstOrNull()
         val interactionPending = approval != null || question != null
@@ -995,63 +936,26 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             persistentOverlay -> localizedText("悬浮按钮会在离开应用后保持可用", "The floating button remains available after you leave the app")
             else -> localizedText("正在准备后台控制", "Preparing background control")
         }
-        val builder = NotificationCompat.Builder(this, channelId)
-            .setSmallIcon(R.drawable.lucide_brain_circuit)
-            .setContentTitle(title)
-            .setContentText(content)
-            .setOngoing(persistentOverlay || hasWork())
-            .setOnlyAlertOnce(!interactionPending)
-            .setPriority(if (interactionPending) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_LOW)
-            .setCategory(if (interactionPending) NotificationCompat.CATEGORY_REMINDER else NotificationCompat.CATEGORY_SERVICE)
-            .setContentIntent(PendingIntent.getActivity(
-                this,
-                0,
-                openConversationIntent(),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            ))
         val selected = conversationId
-        if (selected != null && selected in activeConversations) {
-            builder.addAction(
-                R.drawable.lucide_square,
-                localizedText("停止当前任务", "Stop current task"),
-                PendingIntent.getService(
-                    this,
-                    1,
-                    Intent(this, DeviceOperationOverlayService::class.java).apply {
-                        action = ACTION_STOP
-                        putExtra(EXTRA_CONVERSATION_ID, selected)
-                    },
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                ),
-            )
-        }
-        return builder.build()
+        return OverlayNotificationState(
+            channelId = channelId,
+            title = title,
+            content = content,
+            ongoing = persistentOverlay || hasWork(),
+            interactionPending = interactionPending,
+            selectedConversationId = selected,
+            stoppableConversationId = selected?.takeIf(activeConversations::contains),
+        )
     }
 
     private fun refreshNotification() {
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
+        notificationController.publish(notificationState())
     }
 
-    private fun openConversationIntent() = Intent(this, MainActivity::class.java).apply {
+    private fun openConversationIntent(targetConversationId: String? = conversationId) = Intent(this, MainActivity::class.java).apply {
         action = ACTION_OPEN_CONVERSATION
-        putExtra(EXTRA_CONVERSATION_ID, conversationId)
+        putExtra(EXTRA_CONVERSATION_ID, targetConversationId)
         addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-    }
-
-    private fun createNotificationChannels() {
-        if (Build.VERSION.SDK_INT < 26) return
-        getSystemService(NotificationManager::class.java).apply {
-            createNotificationChannel(NotificationChannel(
-                CHANNEL_ID,
-                localizedText("悬浮助手与 AI 任务", "Floating assistant and AI tasks"),
-                NotificationManager.IMPORTANCE_LOW,
-            ))
-            createNotificationChannel(NotificationChannel(
-                INTERACTION_CHANNEL_ID,
-                localizedText("需要确认或回答", "Approval or answer required"),
-                NotificationManager.IMPORTANCE_HIGH,
-            ).apply { description = localizedText("工具授权和 AI 询问等待处理时提醒", "Alerts for pending tool approvals and AI questions") })
-        }
     }
 
     private fun ToolCallRecord.overlayStep(titles: Map<String, String>) = OverlayStep(
@@ -1122,7 +1026,8 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         if ((voiceInputState as? VoiceInputState.Recording)?.target?.source == VoiceInputSource.OVERLAY) {
             app.voiceInput.cancel()
         }
-        removeOverlay()
+        if (::windowController.isInitialized) removeOverlay()
+        if (::previewController.isInitialized) previewController.close()
         conversationJob?.cancel()
         idleCollapseJob?.cancel()
         scope.cancel()
@@ -1163,7 +1068,6 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         private const val MAX_RESIZE_TRANSITION_DP = 8
         private const val MAX_FULL_MARGIN_DP = 24
         private const val FULL_DRAG_DOCK_THRESHOLD_DP = 16
-        private const val VIRTUAL_SCREEN_PREVIEW_INTERVAL_MILLIS = 500L
         @Volatile private var running = false
         @Volatile private var latestAppVisible = false
         @Volatile private var activeInstance: DeviceOperationOverlayService? = null

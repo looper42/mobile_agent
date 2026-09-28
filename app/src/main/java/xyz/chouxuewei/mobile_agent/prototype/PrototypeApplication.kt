@@ -12,6 +12,7 @@ import xyz.chouxuewei.mobile_agent.data.AppearanceRepository
 import xyz.chouxuewei.mobile_agent.data.RoomConversationStore
 import xyz.chouxuewei.mobile_agent.data.RoomArtifactStore
 import xyz.chouxuewei.mobile_agent.model.OpenAiChatGateway
+import xyz.chouxuewei.mobile_agent.model.streamingChatHttpClient
 import xyz.chouxuewei.mobile_agent.BuildConfig
 import xyz.chouxuewei.mobile_agent.core.ModelConfig
 import xyz.chouxuewei.mobile_agent.data.ModelSettingsRepository
@@ -37,6 +38,7 @@ import xyz.chouxuewei.mobile_agent.voice.VoiceInputController
 import xyz.chouxuewei.mobile_agent.voice.VoiceInputDestination
 
 class PrototypeApplication : Application() {
+    private val chatHttpClient by lazy { streamingChatHttpClient() }
     val deviceGateway by lazy {
         AndroidDeviceGateway.configureRootShell()
         AndroidDeviceGateway(this, MainDisplayOverlayController { hidden ->
@@ -57,13 +59,14 @@ class PrototypeApplication : Application() {
         ToolCatalog.create(this, conversations, artifacts, deviceGateway, userQuestions)
     }
     val chatWorkspace by lazy { xyz.chouxuewei.mobile_agent.chat.ChatWorkspace(this) }
+    val chatPresenter by lazy { xyz.chouxuewei.mobile_agent.chat.ChatPresenter(this, applicationScope) }
     val chatRuntime by lazy {
         ChatRuntime(
             store = conversations,
             connection = { modelProfileId ->
                 val resolved = modelSettings.resolveChatConfiguration(modelProfileId)
                 ChatConnection(
-                    gateway = OpenAiChatGateway(resolved.config),
+                    gateway = OpenAiChatGateway(resolved.config, chatHttpClient),
                     policy = resolved.policy,
                     model = resolved.config.model.orEmpty(),
                     modelProfileId = resolved.profileId,

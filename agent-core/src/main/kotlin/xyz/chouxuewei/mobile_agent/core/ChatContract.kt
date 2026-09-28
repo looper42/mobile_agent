@@ -28,6 +28,14 @@ data class ChatImage(
     val height: Int,
 )
 
+/** Shared request limits enforced before loading and again before network serialization. */
+object ChatImageLimits {
+    const val MAX_COUNT = 10
+    const val MAX_TOTAL_BYTES = 12L * 1024 * 1024
+    const val MAX_SINGLE_PIXELS = 16_000_000L
+    const val MAX_TOTAL_PIXELS = 40_000_000L
+}
+
 fun interface ChatAttachmentLoader {
     suspend fun loadImage(attachment: AttachmentRef): ChatImage
 }
@@ -65,6 +73,40 @@ data class Message(
     val reasoningDurationMillis: Long? = null,
     val assistantSteps: List<AssistantStep> = emptyList(),
 )
+
+/**
+ * A high-frequency reply projection owned by [ChatRuntime]. It is intentionally ephemeral:
+ * Room stores recovery checkpoints and terminal state, while visible streaming text does not
+ * force a database transaction for every model delta.
+ */
+data class StreamingReplySnapshot(
+    val runId: String,
+    val conversationId: String,
+    val replyMessageId: String,
+    val text: String,
+    val assistantSteps: List<AssistantStep>,
+    val revision: Long,
+)
+
+/** Applies an ephemeral stream only while the durable message is still generating. */
+fun List<Message>.withStreamingReply(snapshot: StreamingReplySnapshot?): List<Message> {
+    if (snapshot == null) return this
+    return map { message ->
+        if (message.id != snapshot.replyMessageId || message.status != MessageStatus.GENERATING) {
+            message
+        } else {
+            message.copy(
+                text = snapshot.text,
+                reasoningSteps = snapshot.assistantSteps.map(AssistantStep::reasoning)
+                    .filter(String::isNotBlank),
+                reasoningDurationMillis = snapshot.assistantSteps
+                    .mapNotNull(AssistantStep::reasoningDurationMillis)
+                    .sum().takeIf { it > 0L },
+                assistantSteps = snapshot.assistantSteps,
+            )
+        }
+    }
+}
 data class Run(
     val id: String,
     val conversationId: String,
@@ -114,6 +156,13 @@ interface ConversationStore {
         reasoningEffort: String? = null,
     )
     suspend fun messages(id: String): List<Message>
+    suspend fun messagesThrough(conversationId: String, boundary: Long): List<Message> =
+        messages(conversationId).filter { it.sequence <= boundary }
+    suspend fun messageById(messageId: String): Message? = null
+    suspend fun firstQueuedMessage(conversationId: String): Message? =
+        messages(conversationId).firstOrNull { it.status == MessageStatus.QUEUED }
+    suspend fun hasQueuedMessage(conversationId: String): Boolean =
+        firstQueuedMessage(conversationId) != null
     suspend fun enqueue(id: String, text: String, attachments: List<AttachmentRef>): Message
     suspend fun beginRun(id: String, triggerId: String, model: String): Run
     suspend fun setRunModel(run: Run, model: String)

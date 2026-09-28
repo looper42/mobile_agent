@@ -2,6 +2,7 @@ package xyz.chouxuewei.mobile_agent.data
 
 import android.content.Context
 import androidx.room.Room
+import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
@@ -16,7 +17,19 @@ internal object DatabaseProvider {
                 TOOL_CALL_MIGRATION,
                 ARTIFACT_MIGRATION,
                 CONVERSATION_PIN_MIGRATION,
+                MESSAGE_SEARCH_MIGRATION,
+                REMOVE_LEGACY_AGENT_MIGRATION,
             )
+            .addCallback(object : RoomDatabase.Callback() {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    createMessageSearchTriggers(db)
+                }
+
+                override fun onOpen(db: SupportSQLiteDatabase) {
+                    // Idempotent repair for databases created before the FTS triggers existed.
+                    createMessageSearchTriggers(db)
+                }
+            })
             .build().also { instance = it }
     }
 }
@@ -74,4 +87,73 @@ val CONVERSATION_PIN_MIGRATION = object : Migration(6, 7) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
     }
+}
+
+/**
+ * Full-text history index. Triggers keep the narrow mirror transactionally aligned with messages
+ * and titles, including rows inserted through future store implementations.
+ */
+val MESSAGE_SEARCH_MIGRATION = object : Migration(7, 8) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING FTS4(messageId, conversationId, conversationTitle, role, text, tokenize=unicode61)")
+        db.execSQL(
+            """
+            INSERT INTO message_search(rowid, messageId, conversationId, conversationTitle, role, text)
+            SELECT messages.rowid, messages.id, messages.conversationId, conversations.title, messages.role, messages.text
+            FROM messages INNER JOIN conversations ON conversations.id=messages.conversationId
+            """.trimIndent(),
+        )
+        createMessageSearchTriggers(db)
+    }
+}
+
+/** The production app has one execution path; obsolete task/step loop data is no longer retained. */
+val REMOVE_LEGACY_AGENT_MIGRATION = object : Migration(8, 9) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("DROP TABLE IF EXISTS steps")
+        db.execSQL("DROP TABLE IF EXISTS tasks")
+    }
+}
+
+internal fun createMessageSearchTriggers(db: SupportSQLiteDatabase) {
+    db.execSQL(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_search_after_insert AFTER INSERT ON messages BEGIN
+          INSERT INTO message_search(rowid, messageId, conversationId, conversationTitle, role, text)
+          VALUES (new.rowid, new.id, new.conversationId,
+                  (SELECT title FROM conversations WHERE id=new.conversationId), new.role, new.text);
+        END
+        """.trimIndent(),
+    )
+    db.execSQL(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_search_after_update AFTER UPDATE OF id, conversationId, role, text ON messages BEGIN
+          DELETE FROM message_search WHERE rowid=old.rowid;
+          INSERT INTO message_search(rowid, messageId, conversationId, conversationTitle, role, text)
+          VALUES (new.rowid, new.id, new.conversationId,
+                  (SELECT title FROM conversations WHERE id=new.conversationId), new.role, new.text);
+        END
+        """.trimIndent(),
+    )
+    db.execSQL(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_search_after_delete AFTER DELETE ON messages BEGIN
+          DELETE FROM message_search WHERE rowid=old.rowid;
+        END
+        """.trimIndent(),
+    )
+    db.execSQL(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_search_title_after_update AFTER UPDATE OF title ON conversations BEGIN
+          UPDATE message_search SET conversationTitle=new.title WHERE conversationId=new.id;
+        END
+        """.trimIndent(),
+    )
+    db.execSQL(
+        """
+        CREATE TRIGGER IF NOT EXISTS message_search_conversation_after_delete AFTER DELETE ON conversations BEGIN
+          DELETE FROM message_search WHERE conversationId=old.id;
+        END
+        """.trimIndent(),
+    )
 }

@@ -12,12 +12,10 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 import okhttp3.Call
 import okhttp3.Callback
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import okio.ByteString.Companion.toByteString
+import okio.BufferedSource
 import xyz.chouxuewei.mobile_agent.core.*
 
 /** 与设备动作协议完全独立的文本 SSE 适配器。取消 Flow 会同时关闭 Call 和响应体。 */
@@ -25,8 +23,6 @@ class OpenAiChatGateway(
     private val config: ModelConfig,
     private val client: OkHttpClient,
 ) : ChatModelGateway {
-    constructor(config: ModelConfig) : this(config, streamingChatHttpClient())
-
     override fun stream(request: ChatRequest): Flow<ModelEvent> = callbackFlow {
         val model = config.model?.takeIf { it.isNotBlank() }
         if (model == null) {
@@ -39,99 +35,17 @@ class OpenAiChatGateway(
                 )
             ); close(); return@callbackFlow
         }
-        val payload = buildJsonObject {
-            put("model", model);
-            put("stream", true);
-            put("max_tokens", request.maxOutputTokens)
-            put("max_completion_tokens", request.maxOutputTokens)
-            // OpenAI 兼容流式接口默认可能不返回用量；显式请求后，vLLM 会在 [DONE] 前追加 usage 尾包。
-            putJsonObject("stream_options") { put("include_usage", true) }
-            // 始终显式传 tools，避免 LocalServer 将“字段缺失”解释为启用服务器 MCP。
-            putJsonArray("tools") {
-                request.tools.forEach { tool ->
-                    add(buildJsonObject {
-                        put("type", "function")
-                        putJsonObject("function") {
-                            put("name", tool.id)
-                            put("description", tool.description)
-                            put(
-                                "parameters",
-                                runCatching { Json.parseToJsonElement(tool.inputSchema) }
-                                    .getOrElse { buildJsonObject { put("type", "object") } })
-                        }
-                    })
-                }
-            }
-            request.reasoningEffort?.takeIf(String::isNotBlank)?.let { effort ->
-                config.reasoningEffortField.takeIf(String::isNotBlank)
-                    ?.let { field -> put(field, effort) }
-            }
-            putJsonArray("messages") {
-                request.messages.forEach { turn ->
-                    add(buildJsonObject {
-                        put("role", turn.role)
-                        if (turn.role == "assistant" && turn.toolCalls.isNotEmpty()) {
-                            if (turn.content.isEmpty()) put("content", JsonNull) else put(
-                                "content",
-                                turn.content
-                            )
-                            putJsonArray("tool_calls") {
-                                turn.toolCalls.forEach { call ->
-                                    add(buildJsonObject {
-                                        put("id", call.id); put("type", "function")
-                                        putJsonObject("function") {
-                                            put("name", call.toolId); put(
-                                            "arguments",
-                                            call.argumentsJson
-                                        )
-                                        }
-                                    })
-                                }
-                            }
-                        } else {
-                            if (turn.role == "user" && turn.images.isNotEmpty()) {
-                                putJsonArray("content") {
-                                    if (turn.content.isNotBlank()) add(buildJsonObject {
-                                        put("type", "text")
-                                        put("text", turn.content)
-                                    })
-                                    turn.images.forEach { image ->
-                                        add(buildJsonObject {
-                                            put("type", "image_url")
-                                            putJsonObject("image_url") {
-                                                put(
-                                                    "url",
-                                                    "data:${image.mimeType};base64,${
-                                                        image.bytes.toByteString().base64()
-                                                    }"
-                                                )
-                                                put("detail", "auto")
-                                            }
-                                        })
-                                    }
-                                }
-                            } else {
-                                put("content", turn.content)
-                            }
-                        }
-                        turn.toolCallId?.let { put("tool_call_id", it) }
-                        turn.name?.let { put("name", it) }
-                    })
-                }
-            }
-        }
-
         val base = config.baseUrl.trimEnd('/').let { if (it.endsWith("/v1")) it else "$it/v1" }
-        val payloadText = payload.toString()
+        val requestBody = StreamingChatRequestBody(model, request, config.reasoningEffortField)
         val requestStartedAt = System.currentTimeMillis()
         AgentLog.i("Model") {
-            "request_start model=$model messages=${request.messages.size} tools=${request.tools} images=${request.messages.sumOf { it.images.size }} payload_bytes=${payloadText.toByteArray().size} max_output=${request.maxOutputTokens}"
+            "request_start model=$model messages=${request.messages.size} tools=${request.tools.size} images=${request.messages.sumOf { it.images.size }} estimated_payload_bytes=${requestBody.estimatedBytes} max_output=${request.maxOutputTokens}"
         }
         val call = client.newCall(
             Request.Builder().url("$base/chat/completions")
                 .header("Authorization", "Bearer ${config.apiKey}")
                 .header("Accept", "text/event-stream")
-                .post(payloadText.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .post(requestBody)
                 .build()
         )
         call.enqueue(object : Callback {
@@ -212,12 +126,15 @@ class OpenAiChatGateway(
                                 var finish: String? = null
 
                                 data class PendingCall(
-                                    var id: String = "",
-                                    var name: String = "",
+                                    val id: StringBuilder = StringBuilder(),
+                                    val name: StringBuilder = StringBuilder(),
                                     val arguments: StringBuilder = StringBuilder()
                                 )
 
                                 val pendingCalls = linkedMapOf<Int, PendingCall>()
+                                var responseTextCharacters = 0L
+                                var reasoningCharacters = 0L
+                                var toolArgumentCharacters = 0L
                                 suspend fun dispatch() {
                                     val value = data.toString().trim(); data.clear()
                                     if (value.isEmpty()) return
@@ -242,18 +159,35 @@ class OpenAiChatGateway(
                                         val value = element.jsonObject
                                         val index = value["index"]?.jsonPrimitive?.intOrNull
                                             ?: pendingCalls.size
-                                        val pending = pendingCalls.getOrPut(index) { PendingCall() }
-                                        value["id"]?.jsonPrimitive?.contentOrNull?.let {
-                                            pending.id = it
+                                        require(index in 0 until MAX_TOOL_CALLS) {
+                                            localizedText("模型返回的工具调用过多", "The model returned too many tool calls.")
+                                        }
+                                        val pending = pendingCalls.getOrPut(index) {
+                                            require(pendingCalls.size < MAX_TOOL_CALLS) {
+                                                localizedText("模型返回的工具调用过多", "The model returned too many tool calls.")
+                                            }
+                                            PendingCall()
+                                        }
+                                        value["id"]?.jsonPrimitive?.contentOrNull?.let { chunk ->
+                                            require(pending.id.length + chunk.length <= MAX_TOOL_ID_CHARACTERS)
+                                            pending.id.append(chunk)
                                         }
                                         value["function"]?.jsonObject?.let { function ->
                                             function["name"]?.jsonPrimitive?.contentOrNull?.let { chunk ->
                                                 // tool_calls 的 name 与 arguments 都是 delta 片段，必须按到达顺序原样拼接。
-                                                pending.name += chunk
+                                                require(pending.name.length + chunk.length <= MAX_TOOL_NAME_CHARACTERS)
+                                                pending.name.append(chunk)
                                             }
-                                            function["arguments"]?.jsonPrimitive?.contentOrNull?.let(
-                                                pending.arguments::append
-                                            )
+                                            function["arguments"]?.jsonPrimitive?.contentOrNull?.let { chunk ->
+                                                require(pending.arguments.length + chunk.length <= MAX_TOOL_ARGUMENT_CHARACTERS) {
+                                                    localizedText("模型返回的工具参数过大", "The model returned oversized tool arguments.")
+                                                }
+                                                toolArgumentCharacters += chunk.length
+                                                require(toolArgumentCharacters <= MAX_TOTAL_TOOL_ARGUMENT_CHARACTERS) {
+                                                    localizedText("模型返回的工具参数总量过大", "The model returned too much tool argument data.")
+                                                }
+                                                pending.arguments.append(chunk)
+                                            }
                                         }
                                     }
                                     listOf(
@@ -264,17 +198,29 @@ class OpenAiChatGateway(
                                         (delta?.get(key) as? JsonPrimitive)?.contentOrNull?.takeIf(
                                             String::isNotEmpty
                                         )
-                                    }?.let { text -> send(ModelEvent.ReasoningDelta(text)) }
+                                    }?.let { text ->
+                                        reasoningCharacters += text.length
+                                        require(reasoningCharacters <= MAX_REASONING_CHARACTERS) {
+                                            localizedText("模型思考内容过长", "The model reasoning exceeded the response limit.")
+                                        }
+                                        send(ModelEvent.ReasoningDelta(text))
+                                    }
                                     (delta?.get("content") as? JsonPrimitive)?.contentOrNull
                                         ?.takeIf(String::isNotEmpty)
-                                        ?.let { text -> send(ModelEvent.TextDelta(text)) }
+                                        ?.let { text ->
+                                            responseTextCharacters += text.length
+                                            require(responseTextCharacters <= MAX_RESPONSE_TEXT_CHARACTERS) {
+                                                localizedText("模型回复过长", "The model response exceeded the response limit.")
+                                            }
+                                            send(ModelEvent.TextDelta(text))
+                                        }
                                     choice["finish_reason"]?.jsonPrimitive?.contentOrNull?.let { reason ->
                                         finish = reason
                                     }
                                 }
-                                // Okio 在完整 UTF-8 行上解码，网络包切在中文字符中间也不会乱码。
+                                // 在解码之前限制单行字节数，避免异常服务用一个永不换行的响应占满内存。
                                 while (!done) {
-                                    val line = source.readUtf8Line() ?: break
+                                    val line = source.readBoundedUtf8Line(MAX_SSE_LINE_BYTES) ?: break
                                     when {
                                         line.isEmpty() -> dispatch()
                                         line.startsWith("data:") -> {
@@ -283,7 +229,7 @@ class OpenAiChatGateway(
                                             )
                                         }
                                     }
-                                    check(data.length <= 1_000_000) {
+                                    check(data.length <= MAX_SSE_EVENT_CHARACTERS) {
                                         localizedText(
                                             "模型事件过大",
                                             "The model event is too large."
@@ -296,8 +242,8 @@ class OpenAiChatGateway(
                                         send(
                                             ModelEvent.ToolCall(
                                                 RequestedToolCall(
-                                                    pending.id,
-                                                    pending.name,
+                                                    pending.id.toString(),
+                                                    pending.name.toString(),
                                                     pending.arguments.toString().ifBlank { "{}" },
                                                 )
                                             )
@@ -353,10 +299,31 @@ class OpenAiChatGateway(
 }
 
 /**
- * 流式回复可能在模型长时间推理或组装大型工具参数时暂时没有网络数据。
- * 这里保留 OkHttp 默认的建连超时，但不限制读取间隔和请求总时长；用户停止任务仍会取消 Call。
+ * 共享客户端复用连接池和 TLS 会话。readTimeout 同时约束响应首字节与连续无数据时间，
+ * callTimeout 保持关闭，正常的长回复不会因为总时长被截断；用户停止任务仍会取消 Call。
  */
-internal fun streamingChatHttpClient(): OkHttpClient = OkHttpClient.Builder()
-    .readTimeout(0, TimeUnit.SECONDS)
+fun streamingChatHttpClient(): OkHttpClient = OkHttpClient.Builder()
+    .readTimeout(STREAM_IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .callTimeout(0, TimeUnit.SECONDS)
     .build()
+
+private fun BufferedSource.readBoundedUtf8Line(maxBytes: Long): String? {
+    val newline = indexOf('\n'.code.toByte(), 0, maxBytes + 1)
+    if (newline >= 0) return readUtf8Line()
+    if (request(maxBytes + 1)) throw IOException(
+        localizedText("模型事件单行过大", "A model event line exceeded the allowed size."),
+    )
+    // EOF with a final non-newline-terminated line is valid as long as request() proved it bounded.
+    return readUtf8Line()
+}
+
+private const val STREAM_IDLE_TIMEOUT_SECONDS = 90L
+private const val MAX_SSE_LINE_BYTES = 1_048_576L
+private const val MAX_SSE_EVENT_CHARACTERS = 1_000_000
+private const val MAX_RESPONSE_TEXT_CHARACTERS = 2_000_000L
+private const val MAX_REASONING_CHARACTERS = 2_000_000L
+private const val MAX_TOOL_CALLS = 64
+private const val MAX_TOOL_ID_CHARACTERS = 512
+private const val MAX_TOOL_NAME_CHARACTERS = 256
+private const val MAX_TOOL_ARGUMENT_CHARACTERS = 1_000_000
+private const val MAX_TOTAL_TOOL_ARGUMENT_CHARACTERS = 2_000_000L

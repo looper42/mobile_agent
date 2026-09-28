@@ -36,6 +36,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        (application as PrototypeApplication).chatWorkspace.flushDrafts()
         DeviceOperationOverlayService.setAppVisible(this, false)
         super.onStop()
     }

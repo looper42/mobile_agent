@@ -73,7 +73,6 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -109,7 +108,7 @@ import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
-import kotlinx.coroutines.flow.flowOf
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
@@ -138,6 +137,7 @@ import xyz.chouxuewei.mobile_agent.core.ToolSummary
 import xyz.chouxuewei.mobile_agent.core.UserQuestionRequest
 import xyz.chouxuewei.mobile_agent.core.userFacingMessage
 import xyz.chouxuewei.mobile_agent.core.localizedText
+import xyz.chouxuewei.mobile_agent.core.withStreamingReply
 import xyz.chouxuewei.mobile_agent.data.ModelSettings
 import xyz.chouxuewei.mobile_agent.data.ModelProfile
 import xyz.chouxuewei.mobile_agent.data.REASONING_EFFORT_OFF
@@ -155,37 +155,31 @@ import xyz.chouxuewei.mobile_agent.voice.VoiceInputTarget
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatApp(app: PrototypeApplication) {
-    val preference by app.appearance.theme.collectAsState(initial = null)
     val workspace = app.chatWorkspace
-    val current by workspace.current.collectAsState()
-    val all by app.conversations.observeConversations().collectAsState(emptyList())
-    val drafts by workspace.drafts.collectAsState()
-    val active by app.chatRuntime.active.collectAsState()
-    val notices by app.chatRuntime.notices.collectAsState()
-    val contextUsages by app.chatRuntime.contextUsage.collectAsState()
-    val approvals by app.chatRuntime.approvals.collectAsState()
-    val questions by app.userQuestions.requests.collectAsState()
-    val incomingShares by app.attachments.incoming.collectAsState()
-    val persistentOverlay by app.appearance.persistentOverlay.collectAsState(initial = null)
-    val attachmentError by app.attachments.error.collectAsState()
-    val deviceMode by app.deviceGateway.activeMode.collectAsState()
+    val session by app.chatPresenter.session.collectAsStateWithLifecycle()
+    val environment by app.chatPresenter.environment.collectAsStateWithLifecycle()
+    val timeline by app.chatPresenter.timeline.collectAsStateWithLifecycle()
+    val preference = environment.themePreference
+    val current = session.currentConversationId
+    val all = session.conversations
+    val drafts = session.drafts
+    val active = session.activeConversationIds
+    val notices = session.notices
+    val contextUsages = session.contextUsages
+    val approvals = session.approvals
+    val questions = session.questions
+    val incomingShares = session.incomingShares
+    val persistentOverlay = environment.persistentOverlay
+    val attachmentError = environment.attachmentError
+    val deviceMode = environment.deviceMode
     val pendingApproval = approvals.values.firstOrNull()
     val pendingQuestion = questions.values.firstOrNull()
     val incomingShare = incomingShares.firstOrNull()
-    val toolAccesses by app.toolPermissions.accesses.collectAsState(emptyMap())
-    val error by workspace.error.collectAsState()
-    val settings by app.modelSettings.settings.collectAsState(ModelSettings())
-    val speechSettings by app.speechSettings.settings.collectAsState(initial = SpeechSettings())
-    val voiceInputState by app.voiceInput.state.collectAsState()
-    val messages by remember(current) {
-        current?.let(app.conversations::observeMessages) ?: flowOf(emptyList())
-    }.collectAsState(emptyList())
-    val toolCalls by remember(current) {
-        current?.let(app.conversations::observeToolCalls) ?: flowOf(emptyList())
-    }.collectAsState(emptyList())
-    val conversationArtifacts by remember(current) {
-        current?.let(app.artifacts::observeArtifacts) ?: flowOf(emptyList<Artifact>())
-    }.collectAsState(emptyList())
+    val toolAccesses = environment.toolAccesses
+    val error = session.error
+    val settings = environment.modelSettings
+    val speechSettings = environment.speechSettings
+    val voiceInputState = environment.voiceInputState
     val toolTitles = remember(app) {
         app.toolRegistry.definitions.associate { definition -> definition.id to definition.title }
     }
@@ -195,7 +189,7 @@ fun ChatApp(app: PrototypeApplication) {
     var panel by rememberSaveable { mutableStateOf<String?>(null) }
     var toolCapabilities by remember { mutableStateOf<List<ToolCapability>>(emptyList()) }
     var settingsPage by rememberSaveable { mutableStateOf<String?>(null) }
-    val requestedSettingsPage by app.requestedSettingsPage.collectAsState()
+    val requestedSettingsPage = environment.requestedSettingsPage
     var menu by remember { mutableStateOf(false) }
     var search by rememberSaveable { mutableStateOf("") }
     var summary by remember { mutableStateOf<ContextSnapshot?>(null) }
@@ -430,9 +424,7 @@ fun ChatApp(app: PrototypeApplication) {
                     } else {
                         holder.SaveableStateProvider(id) {
                             ChatTimeline(
-                                messages = messages,
-                                toolCalls = toolCalls,
-                                artifacts = conversationArtifacts,
+                                timeline = timeline,
                                 toolTitles = toolTitles,
                                 notice = notices[id],
                                 artifactActions = artifactActions,
@@ -617,7 +609,7 @@ fun ChatApp(app: PrototypeApplication) {
                 onSource = { sourceId ->
                     scope.launch {
                         sourceMessage = current?.let { id ->
-                            app.conversations.messages(id).firstOrNull { it.id == sourceId }
+                            app.conversations.messageById(sourceId)?.takeIf { it.conversationId == id }
                         }
                         if (sourceMessage == null) workspace.error.value = localizedText("暂时无法读取这条历史消息，请稍后重试", "This history message is temporarily unavailable. Please try again later.")
                     }
@@ -1056,14 +1048,15 @@ private fun LoadingConversation(modifier: Modifier = Modifier) {
 
 @Composable
 private fun ChatTimeline(
-    messages: List<Message>,
-    toolCalls: List<ToolCallRecord>,
-    artifacts: List<Artifact>,
+    timeline: ConversationTimelineState,
     toolTitles: Map<String, String>,
     notice: String?,
     artifactActions: ArtifactActions,
     modifier: Modifier,
 ) {
+    val messages = timeline.messages
+    val toolCalls = timeline.toolCalls
+    val artifacts = timeline.artifacts
     val list = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var follow by rememberSaveable { mutableStateOf(true) }
@@ -1091,8 +1084,8 @@ private fun ChatTimeline(
                 items(messages, key = { it.id }) { message ->
                     MessageRow(
                         message,
-                        toolCalls.filter { it.replyMessageId == message.id },
-                        artifacts.filter { it.replyMessageId == message.id },
+                        timeline.callsByReply[message.id].orEmpty(),
+                        timeline.artifactsByReply[message.id].orEmpty(),
                         toolTitles,
                         artifactActions,
                     )

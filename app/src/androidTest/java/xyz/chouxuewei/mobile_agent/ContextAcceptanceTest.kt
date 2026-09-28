@@ -10,6 +10,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import xyz.chouxuewei.mobile_agent.core.*
 import xyz.chouxuewei.mobile_agent.model.OpenAiChatGateway
+import xyz.chouxuewei.mobile_agent.model.streamingChatHttpClient
 import xyz.chouxuewei.mobile_agent.prototype.PrototypeApplication
 
 @RunWith(AndroidJUnit4::class)
@@ -39,7 +40,7 @@ class ContextAcceptanceTest {
         val before=store.messages(c.id)
         val manager=ContextManager(store)
         val config=app.modelSettings.loadConfig()
-        val gateway=OpenAiChatGateway(config)
+        val gateway=OpenAiChatGateway(config,streamingChatHttpClient())
         val arguments=InstrumentationRegistry.getArguments()
         val policy=ContextPolicy(arguments.getString("windowTokens","16384").toInt(),arguments.getString("outputReserve","6144").toInt())
         val turns=withTimeout(180000) { manager.prepare(c.id,Long.MAX_VALUE,policy,"configured-test-model",gateway) }

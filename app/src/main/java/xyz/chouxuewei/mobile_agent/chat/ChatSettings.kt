@@ -52,7 +52,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -81,6 +80,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.os.LocaleListCompat
 import kotlinx.coroutines.launch
 import xyz.chouxuewei.mobile_agent.BuildConfig
@@ -247,13 +247,14 @@ fun ChatSettings(
                 it,
             )
         }
-    val activeRuns by app.chatRuntime.active.collectAsState()
-    val detailedLogging by app.appearance.detailedLogging.collectAsState(initial = false)
-    val persistentOverlay by app.appearance.persistentOverlay.collectAsState(initial = false)
-    val maxSteps by app.agentExecutionSettings.maxSteps.collectAsState(initial = DEFAULT_SINGLE_RUN_MAX_STEPS)
-    val personalizedInstructions by app.personalization.instructions.collectAsState(initial = "")
-    val modelUsage by app.modelUsage.usage.collectAsState(initial = emptyList())
-    val speechSettings by app.speechSettings.settings.collectAsState(initial = SpeechSettings())
+    val settingsState by app.chatPresenter.settings.collectAsStateWithLifecycle()
+    val activeRuns = settingsState.activeConversationIds
+    val detailedLogging = settingsState.detailedLogging
+    val persistentOverlay = settingsState.persistentOverlay
+    val maxSteps = settingsState.maxSteps
+    val personalizedInstructions = settingsState.personalizedInstructions
+    val modelUsage = settingsState.modelUsage
+    val speechSettings = settingsState.speechSettings
     val tabs = listOf(
         SettingsTab("general", localizedText("通用", "General"), R.drawable.lucide_settings),
         SettingsTab("personalization", localizedText("个性化", "Personalization"), R.drawable.lucide_sparkles),

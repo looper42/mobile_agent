@@ -135,13 +135,7 @@ class RootDeviceService : RootService() {
 
         override fun captureMain(): ParcelFileDescriptor = call {
             val pipe = ParcelFileDescriptor.createPipe()
-            Thread({
-                ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { output ->
-                    val process = ProcessBuilder("/system/bin/screencap", "-p").redirectErrorStream(false).start()
-                    process.inputStream.use { it.copyTo(output) }
-                    check(process.waitFor() == 0) { localizedText("主屏截图失败", "Main-screen screenshot failed.") }
-                }
-            }, "main-display-capture").apply { isDaemon = true; start() }
+            DeviceCommands.capturePng(ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]))
             pipe[0]
         }
     }

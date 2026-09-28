@@ -19,7 +19,26 @@ class ChatWorkspace(private val app: PrototypeApplication) {
     val current = MutableStateFlow<String?>(null)
     val drafts = MutableStateFlow<Map<String, ComposerDraft>>(emptyMap())
     val error = MutableStateFlow<String?>(null)
-    private val commands = Channel<suspend () -> Unit>(Channel.UNLIMITED)
+    private val commands = Channel<suspend () -> Unit>(Channel.BUFFERED)
+    private val draftPersistence = DraftPersistenceCoordinator(
+        scope = app.applicationScope,
+        persist = { pending ->
+            app.conversations.saveDraft(
+                pending.conversationId,
+                pending.draft.text,
+                pending.draft.attachments,
+                null,
+            )
+            app.attachments.release(pending.draft.attachments)
+            if (pending.cleanupAttachments) app.attachments.cleanup()
+        },
+        onFailure = { failure ->
+            error.value = userFacingMessage(
+                failure,
+                localizedText("草稿未保存，请重试", "The draft was not saved. Please try again."),
+            )
+        },
+    )
     init {
         app.applicationScope.launch {
             for (command in commands) try {
@@ -37,8 +56,13 @@ class ChatWorkspace(private val app: PrototypeApplication) {
             activate(conversation)
         }
     }
-    private fun dispatch(block: suspend () -> Unit) { commands.trySend(block) }
+    private fun dispatch(block: suspend () -> Unit) {
+        if (commands.trySend(block).isFailure) {
+            app.applicationScope.launch { commands.send(block) }
+        }
+    }
     private suspend fun activate(c: Conversation) {
+        current.value?.takeIf { it != c.id }?.let { draftPersistence.flush(it) }
         if (drafts.value[c.id] == null) {
             drafts.update {
                 it + (c.id to ComposerDraft(c.draft, c.attachments))
@@ -52,14 +76,11 @@ class ChatWorkspace(private val app: PrototypeApplication) {
     fun edit(id: String, draft: ComposerDraft) {
         val previousAttachments = drafts.value[id]?.attachments.orEmpty().map(AttachmentRef::uri).toSet()
         drafts.update { it + (id to draft) }
-        dispatch {
-            // reasoningEffort 参数只为旧数据库结构保留；实际选择已迁到全局模型设置。
-            app.conversations.saveDraft(id, draft.text, draft.attachments, null)
-            app.attachments.release(draft.attachments)
-            if (previousAttachments != draft.attachments.map(AttachmentRef::uri).toSet()) {
-                app.attachments.cleanup()
-            }
-        }
+        draftPersistence.submit(
+            conversationId = id,
+            draft = draft,
+            cleanupAttachments = previousAttachments != draft.attachments.map(AttachmentRef::uri).toSet(),
+        )
     }
     fun send(id: String, reasoningEffort: String?, modelProfileId: String? = null) {
         val draft = drafts.value[id] ?: return
@@ -73,11 +94,17 @@ class ChatWorkspace(private val app: PrototypeApplication) {
         drafts.update { it + (id to cleared) }
         dispatch {
             try {
+                // Save the visible version, then remove the writer before enqueue clears the draft.
+                // This prevents a delayed draft write from resurrecting already-sent text.
+                draftPersistence.flushAndRemove(id)
                 app.chatRuntime.send(id, draft.text, draft.attachments, reasoningEffort, modelProfileId)
                 app.attachments.cleanup()
             }
             catch (e: Exception) {
-                if (drafts.value[id] == cleared) drafts.update { it + (id to draft) }
+                if (drafts.value[id] == cleared) {
+                    drafts.update { it + (id to draft) }
+                    draftPersistence.submit(id, draft, cleanupAttachments = false)
+                }
                 throw e
             }
         }
@@ -129,8 +156,13 @@ class ChatWorkspace(private val app: PrototypeApplication) {
                     attachments = (existing.attachments + share.attachments).distinctBy(AttachmentRef::uri),
                 )
                 drafts.update { it + (conversation.id to merged) }
-                app.conversations.saveDraft(conversation.id, merged.text, merged.attachments, null)
-                app.attachments.release(share.attachments)
+                draftPersistence.submit(
+                    conversation.id,
+                    merged,
+                    cleanupAttachments = existing.attachments.map(AttachmentRef::uri).toSet() !=
+                        merged.attachments.map(AttachmentRef::uri).toSet(),
+                )
+                draftPersistence.flushAndRemove(conversation.id)
                 activate(conversation)
             } catch (failure: Exception) {
                 app.attachments.restore(share)
@@ -144,10 +176,12 @@ class ChatWorkspace(private val app: PrototypeApplication) {
     }
     fun stop(id: String) { app.applicationScope.launch { app.chatRuntime.stop(id) } }
     fun compact(id: String) { app.applicationScope.launch { app.chatRuntime.compact(id) } }
+    fun flushDrafts() { app.applicationScope.launch { draftPersistence.flushAll() } }
     fun rename(id: String, title: String) = dispatch { app.conversations.rename(id, title) }
     fun setPinned(id: String, pinned: Boolean) = dispatch { app.conversations.setPinned(id, pinned) }
     fun deleteConversation(id: String) = dispatch {
         require(id !in app.chatRuntime.active.value) { localizedText("这段对话正在回复，请停止后再删除", "This conversation is responding. Stop it before deleting.") }
+        draftPersistence.discard(id)
         val deletingCurrent = current.value == id
         app.conversations.deleteConversation(id)
         drafts.update { it - id }

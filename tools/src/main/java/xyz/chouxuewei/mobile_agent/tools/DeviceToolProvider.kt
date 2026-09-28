@@ -1,5 +1,6 @@
 package xyz.chouxuewei.mobile_agent.tools
 
+import android.os.SystemClock
 import xyz.chouxuewei.mobile_agent.core.localizedText
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -27,6 +28,19 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
     override val title get() = localizedText("手机操作", "Phone operation")
     override val description
         get() = localizedText("经你授权后，可把临时界面截图和节点信息交给当前模型分析，并操作手机。需要 Root 权限。", "After your approval, provide temporary screen images and node information to the current model and operate the phone. Root access is required.")
+
+    private val handlers: Map<String, DeviceToolHandler> by lazy {
+        mapOf(
+            "device_list_apps" to DeviceToolHandler { args, _ -> listApps(args) },
+            "device_open" to DeviceToolHandler(::open),
+            "device_observe" to DeviceToolHandler(::observe),
+            "device_action" to DeviceToolHandler(::action),
+            "device_batch" to DeviceToolHandler(::batch),
+            "device_gesture" to DeviceToolHandler(::gesture),
+            "device_wait_for" to DeviceToolHandler(::waitFor),
+            "device_close" to DeviceToolHandler(::close),
+        )
+    }
 
     override suspend fun availability(): ToolAvailability =
         when (val result = gateway.availability()) {
@@ -120,17 +134,9 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         context: ToolExecutionContext
     ): ToolResult = toolResult {
         val args = call.arguments()
-        when (call.toolId) {
-            "device_list_apps" -> listApps(args)
-            "device_open" -> open(args, context)
-            "device_observe" -> observe(args, context)
-            "device_action" -> action(args, context)
-            "device_batch" -> batch(args, context)
-            "device_gesture" -> gesture(args, context)
-            "device_wait_for" -> waitFor(args, context)
-            "device_close" -> close(args, context)
-            else -> error(localizedText("设备工具不支持 ${call.toolId}", "Device tools do not support ${call.toolId}"))
-        }
+        val handler = handlers[call.toolId]
+            ?: error(localizedText("设备工具不支持 ${call.toolId}", "Device tools do not support ${call.toolId}"))
+        handler.execute(args, context)
     }
 
     override fun approvalSummary(call: RequestedToolCall): String? = runCatching {
@@ -352,7 +358,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             args["expected_package"]?.jsonPrimitive?.contentOrNull?.takeIf(String::isNotBlank)
         val finalObservation = args["final_observation"]?.jsonPrimitive?.booleanOrNull ?: true
         val completed = mutableListOf<String>()
-        val startedAt = System.currentTimeMillis()
+        val startedAt = SystemClock.elapsedRealtime()
         AgentLog.i("DeviceBatch") { "batch_start session=$session steps=${steps.size}" }
 
         for ((index, step) in steps.withIndex()) {
@@ -384,7 +390,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
             }
         }
         AgentLog.i("DeviceBatch") {
-            "batch_finish session=$session completed=${completed.size} duration_ms=${System.currentTimeMillis() - startedAt}"
+            "batch_finish session=$session completed=${completed.size} duration_ms=${SystemClock.elapsedRealtime() - startedAt}"
         }
         return batchResult(
             session = session,
@@ -535,7 +541,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         val expectPresent = value["state"]?.jsonPrimitive?.contentOrNull != "absent"
         val timeoutMs = int(value, "timeout_ms", 5_000).coerceIn(0, 10_000)
         val intervalMs = int(value, "interval_ms", 300).coerceIn(150, 2_000)
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (true) {
             currentCoroutineContext().ensureActive()
             val observation = inspectForBatch(session)
@@ -546,7 +552,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                             .filterNotNull().any { it.contains(text, ignoreCase = true) }
                     })
             if (matched == expectPresent) return
-            if (System.currentTimeMillis() >= deadline) {
+            if (SystemClock.elapsedRealtime() >= deadline) {
                 throw BatchStepFailure(localizedText("等待界面状态超时", "Timed out waiting for the screen state."))
             }
             delay(intervalMs.toLong())
@@ -793,7 +799,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
         val expectPresent = args["state"]?.jsonPrimitive?.contentOrNull != "absent"
         val timeoutMs = int(args, "timeout_ms", 5_000).coerceIn(0, 10_000)
         val intervalMs = int(args, "interval_ms", 500).coerceIn(200, 2_000)
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (true) {
             // 轮询期间只读节点，条件达成或超时时才生成一张要发给模型的截图。
             when (val result = gateway.inspect(session)) {
@@ -810,7 +816,7 @@ class DeviceToolProvider(private val gateway: DeviceGateway) : ToolProvider {
                         if (expectPresent) localizedText("界面目标已出现", "Screen target appeared") else localizedText("界面目标已消失", "Screen target disappeared"),
                         text,
                     )
-                    if (System.currentTimeMillis() >= deadline) {
+                    if (SystemClock.elapsedRealtime() >= deadline) {
                         val latest =
                             finalWaitObservation(session, localizedText("等待界面状态超时，已返回最新界面", "Timed out waiting for the screen state; returned the latest screen."))
                         return latest.copy(
