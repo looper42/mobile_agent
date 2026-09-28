@@ -1,8 +1,6 @@
 package xyz.chouxuewei.mobile_agent.overlay
 
 import android.os.Build
-import androidx.compose.animation.Crossfade
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -53,6 +51,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
@@ -68,6 +67,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -109,6 +109,7 @@ internal data class VirtualScreenPreview(
 
 internal data class OverlayViewState(
     val presentation: OverlayPresentation = OverlayPresentation.EDGE_HANDLE,
+    val fullChatContentReady: Boolean = true,
     val theme: ThemePreference = ThemePreference.SYSTEM,
     val selectedConversationId: String? = null,
     val conversations: List<Conversation> = emptyList(),
@@ -182,16 +183,63 @@ internal fun nextOverlayVoiceReleaseAction(
 @Composable
 internal fun OverlayContent(state: OverlayViewState, actions: OverlayActions) {
     Mobile_agentTheme(state.theme) {
-        Crossfade(
-            targetState = state.presentation,
-            animationSpec = tween(durationMillis = 140),
-            label = "overlay-presentation",
-        ) { presentation ->
-            when (presentation) {
+        var retainFullChat by remember {
+            mutableStateOf(state.presentation == OverlayPresentation.FULL_CHAT)
+        }
+        LaunchedEffect(state.presentation) {
+            when (state.presentation) {
+                OverlayPresentation.FULL_CHAT -> retainFullChat = true
+                OverlayPresentation.SUMMARY -> if (!retainFullChat) {
+                    // Let the compact summary draw first, then prepare the full composition while
+                    // the user is reading it. Later collapse/expand cycles reuse the same tree.
+                    withFrameNanos { }
+                    retainFullChat = true
+                }
+                OverlayPresentation.EDGE_HANDLE -> Unit
+            }
+        }
+        Box(Modifier.fillMaxSize()) {
+            val fullChatActive = state.presentation == OverlayPresentation.FULL_CHAT &&
+                state.fullChatContentReady
+            if (fullChatActive || retainFullChat) {
+                FullChatOverlay(
+                    state = state,
+                    actions = actions,
+                    modifier = if (fullChatActive) {
+                        Modifier.fillMaxSize()
+                    } else {
+                        Modifier.size(0.dp).clearAndSetSemantics { }
+                    },
+                    active = fullChatActive,
+                )
+            }
+            when (state.presentation) {
                 OverlayPresentation.EDGE_HANDLE -> EdgeHandle(state, actions)
                 OverlayPresentation.SUMMARY -> SummaryOverlay(state, actions)
-                OverlayPresentation.FULL_CHAT -> FullChatOverlay(state, actions)
+                OverlayPresentation.FULL_CHAT -> if (!state.fullChatContentReady) {
+                    FullChatShell()
+                }
             }
+        }
+    }
+}
+
+@Composable
+private fun FullChatShell() {
+    val colors = LocalChatColors.current
+    Surface(
+        Modifier.fillMaxSize().testTag("overlay_full_chat_shell"),
+        shape = RoundedCornerShape(22.dp),
+        color = colors.surface,
+        border = BorderStroke(1.dp, colors.outline.copy(alpha = .72f)),
+        shadowElevation = 14.dp,
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(
+                Modifier.size(22.dp),
+                color = colors.accent,
+                strokeWidth = 2.dp,
+            )
         }
     }
 }
@@ -414,7 +462,12 @@ private fun SummaryOverlay(state: OverlayViewState, actions: OverlayActions) {
 }
 
 @Composable
-private fun FullChatOverlay(state: OverlayViewState, actions: OverlayActions) {
+private fun FullChatOverlay(
+    state: OverlayViewState,
+    actions: OverlayActions,
+    modifier: Modifier = Modifier,
+    active: Boolean = true,
+) {
     val colors = LocalChatColors.current
     var sessionsOpen by rememberSaveable { mutableStateOf(false) }
     var virtualScreenFocused by rememberSaveable { mutableStateOf(false) }
@@ -425,7 +478,9 @@ private fun FullChatOverlay(state: OverlayViewState, actions: OverlayActions) {
         if (!showsVirtualScreen || approval != null || question != null) virtualScreenFocused = false
     }
     Surface(
-        Modifier.fillMaxSize().testTag("overlay_full_chat"),
+        modifier.fillMaxSize().then(
+            if (active) Modifier.testTag("overlay_full_chat") else Modifier,
+        ),
         shape = RoundedCornerShape(22.dp),
         color = colors.surface,
         border = BorderStroke(1.dp, colors.outline.copy(alpha = .72f)),
@@ -468,7 +523,9 @@ private fun FullChatOverlay(state: OverlayViewState, actions: OverlayActions) {
                             onStop = actions::stopCurrent,
                         )
                     }
-                    OverlayTimeline(state, Modifier.weight(1f))
+                    androidx.compose.runtime.key(state.selectedConversationId) {
+                        OverlayTimeline(state, Modifier.weight(1f))
+                    }
                     OverlayReasoningIndicator(state)
                     if (approval != null) {
                         ApprovalCard(approval, actions)
@@ -940,11 +997,17 @@ private fun OverlayReasoningIndicator(state: OverlayViewState) {
 
 @Composable
 private fun OverlayTimeline(state: OverlayViewState, modifier: Modifier) {
-    val list = rememberLazyListState()
+    // The trailing anchor is a real item at messages.size. Starting there avoids composing the
+    // top of the conversation and immediately laying out a second time to jump to the bottom.
+    val list = rememberLazyListState(initialFirstVisibleItemIndex = state.messages.size)
     val scope = rememberCoroutineScope()
+    val callsByReply = remember(state.toolCalls) {
+        state.toolCalls.groupBy(ToolCallRecord::replyMessageId)
+    }
     // 每次进入展开态或切换会话都默认跟随底部；用户手动上滑后只在本次展开期间停止跟随。
     var follow by remember(state.selectedConversationId) { mutableStateOf(true) }
     var programmaticScroll by remember { mutableStateOf(false) }
+    var initialPositionApplied by remember { mutableStateOf(false) }
     val latestIndex = state.messages.size
     LaunchedEffect(list) {
         snapshotFlow { list.isScrollInProgress to list.canScrollForward }.collect { (scrolling, below) ->
@@ -959,7 +1022,11 @@ private fun OverlayTimeline(state: OverlayViewState, modifier: Modifier) {
         state.toolCalls.size,
         state.toolCalls.lastOrNull()?.status,
     ) {
-        if (follow && state.messages.isNotEmpty()) list.scrollToItem(latestIndex)
+        if (!initialPositionApplied) {
+            initialPositionApplied = true
+        } else if (follow && state.messages.isNotEmpty()) {
+            list.scrollToItem(latestIndex)
+        }
     }
     if (state.messages.isEmpty()) {
         Box(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -975,8 +1042,8 @@ private fun OverlayTimeline(state: OverlayViewState, modifier: Modifier) {
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            items(state.messages, key = Message::id) { message ->
-                OverlayMessage(message, state.toolCalls.filter { it.replyMessageId == message.id }, state.toolTitles)
+            items(state.messages, key = Message::id, contentType = Message::role) { message ->
+                OverlayMessage(message, callsByReply[message.id].orEmpty(), state.toolTitles)
             }
             // 独立末尾锚点让默认/跟随滚动落在内容底部，而不是最后一条消息的开头。
             item(key = "overlay_timeline_bottom") { Spacer(Modifier.height(1.dp)) }
@@ -1033,7 +1100,9 @@ private fun OverlayMessage(message: Message, calls: List<ToolCallRecord>, toolTi
         } else {
             Text("Mobile Agent", color = colors.secondary, style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.SemiBold)
-            val steps = buildOverlayMessageSteps(message, calls, toolTitles)
+            val steps = remember(message, calls, toolTitles) {
+                buildOverlayMessageSteps(message, calls, toolTitles)
+            }
             if (steps.isNotEmpty()) {
                 OverlayMessageStepper(steps)
             } else if (message.status == MessageStatus.GENERATING && calls.isEmpty() &&

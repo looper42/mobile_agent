@@ -32,6 +32,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -241,12 +242,13 @@ fun ToolSummaryRow(summary: ToolSummary) {
 fun ReplyBody(text: String) {
     val uriHandler = LocalUriHandler.current
     val colors = LocalChatColors.current
+    val blocks = remember(text) { parseReplyBlocks(text) }
     SelectionContainer {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            text.split("```").forEachIndexed { index, block ->
-                if (index % 2 == 1) {
-                    Text(
-                        block.substringAfter('\n', block).trimEnd(),
+            blocks.forEach { block ->
+                when (block) {
+                    is ReplyBlock.Code -> Text(
+                        block.value,
                         Modifier.fillMaxWidth()
                             .background(colors.muted, RoundedCornerShape(14.dp))
                             .horizontalScroll(rememberScrollState())
@@ -255,12 +257,31 @@ fun ReplyBody(text: String) {
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                } else {
-                    block.trim().split(Regex("\n\\s*\n")).filter(String::isNotBlank).forEach { paragraph ->
-                        MarkdownParagraph(paragraph) { url -> runCatching { uriHandler.openUri(url) } }
+                    is ReplyBlock.Paragraph -> MarkdownParagraph(block.value) { url ->
+                        runCatching { uriHandler.openUri(url) }
                     }
                 }
             }
+        }
+    }
+}
+
+private sealed interface ReplyBlock {
+    data class Code(val value: String) : ReplyBlock
+    data class Paragraph(val value: String) : ReplyBlock
+}
+
+private val MARKDOWN_PARAGRAPH_SEPARATOR = Regex("\n\\s*\n")
+private val MARKDOWN_INLINE = Regex("\\[([^\\]]+)]\\((https?://[^ )]+)\\)|\\*\\*([^*]+)\\*\\*")
+
+private fun parseReplyBlocks(text: String): List<ReplyBlock> = buildList {
+    text.split("```").forEachIndexed { index, block ->
+        if (index % 2 == 1) {
+            add(ReplyBlock.Code(block.substringAfter('\n', block).trimEnd()))
+        } else {
+            block.trim().split(MARKDOWN_PARAGRAPH_SEPARATOR)
+                .filter(String::isNotBlank)
+                .forEach { add(ReplyBlock.Paragraph(it)) }
         }
     }
 }
@@ -270,8 +291,8 @@ private fun MarkdownParagraph(paragraph: String, onOpenUrl: (String) -> Unit) {
     val colors = LocalChatColors.current
     val heading = paragraph.takeWhile { it == '#' }.length
     val value = if (heading in 1..6) paragraph.drop(heading).trimStart() else paragraph
-    val annotated = linkAndBoldText(value, colors.accent)
-    val isWide = paragraph.lines().any { line -> line.count { it == '|' } >= 3 }
+    val annotated = remember(value, colors.accent) { linkAndBoldText(value, colors.accent) }
+    val isWide = remember(paragraph) { paragraph.lines().any { line -> line.count { it == '|' } >= 3 } }
     ClickableText(
         text = annotated,
         modifier = if (isWide) Modifier.horizontalScroll(rememberScrollState()) else Modifier,
@@ -284,9 +305,8 @@ private fun MarkdownParagraph(paragraph: String, onOpenUrl: (String) -> Unit) {
 }
 
 private fun linkAndBoldText(value: String, accent: Color): AnnotatedString = buildAnnotatedString {
-    val regex = Regex("\\[([^\\]]+)]\\((https?://[^ )]+)\\)|\\*\\*([^*]+)\\*\\*")
     var start = 0
-    regex.findAll(value).forEach { match ->
+    MARKDOWN_INLINE.findAll(value).forEach { match ->
         append(value.substring(start, match.range.first))
         if (match.groupValues[2].isNotEmpty()) {
             pushStringAnnotation("url", match.groupValues[2])

@@ -408,7 +408,9 @@ fun ChatApp(app: PrototypeApplication) {
                             scope.launch { drawer.close() }
                         },
                         onSelect = { id ->
-                            workspace.select(id)
+                            all.firstOrNull { it.id == id }
+                                ?.let { conversation -> workspace.select(conversation) }
+                                ?: workspace.select(id)
                             scope.launch { drawer.close() }
                         },
                         onSetPinned = workspace::setPinned,
@@ -461,6 +463,8 @@ fun ChatApp(app: PrototypeApplication) {
                 ) {
                     val id = current
                     if (id == null) {
+                        LoadingConversation(Modifier.weight(1f))
+                    } else if (timeline.conversationId != id) {
                         LoadingConversation(Modifier.weight(1f))
                     } else {
                         holder.SaveableStateProvider(id) {
@@ -1130,7 +1134,7 @@ private fun ChatTimeline(
                 contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp),
             ) {
-                items(messages, key = { it.id }) { message ->
+                items(messages, key = { it.id }, contentType = { it.role }) { message ->
                     MessageRow(
                         message,
                         timeline.callsByReply[message.id].orEmpty(),

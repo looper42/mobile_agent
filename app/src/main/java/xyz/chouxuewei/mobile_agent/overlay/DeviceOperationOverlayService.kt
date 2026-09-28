@@ -117,6 +117,8 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
     private var stopping = false
     private var completionConversationId: String? = null
     private var completionHold = false
+    private var fullChatContentReady = true
+    private var presentationRevision = 0L
     private var resizeHint: String? = null
     private var virtualScreenPreview: VirtualScreenPreview? = null
     private var conversationJob: Job? = null
@@ -375,7 +377,11 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
             conversationId = id
             observeConversation(id)
         }
-        if (syncWorkspace) app.chatWorkspace.select(id)
+        if (syncWorkspace) {
+            conversations.firstOrNull { it.id == id }
+                ?.let { conversation -> app.chatWorkspace.select(conversation) }
+                ?: app.chatWorkspace.select(id)
+        }
         publishState()
     }
 
@@ -420,12 +426,33 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         val before = presentation.presentation
         presentation.change()
         if (before != presentation.presentation) {
+            val revision = ++presentationRevision
+            val enteringFullChat = presentation.presentation == OverlayPresentation.FULL_CHAT
+            fullChatContentReady = !enteringFullChat
             if (presentation.presentation != OverlayPresentation.FULL_CHAT) {
                 inputFocusActive = false
             }
             fullDragSession = null
             resizeHint = null
             applyPresentation(before, dockEdgeOverride)
+            if (enteringFullChat) {
+                val view = overlay
+                if (view == null) {
+                    fullChatContentReady = true
+                } else {
+                    // Split WindowManager resize and full Compose layout across adjacent frames.
+                    view.postOnAnimation {
+                        view.postOnAnimation {
+                            if (presentationRevision == revision &&
+                                presentation.presentation == OverlayPresentation.FULL_CHAT
+                            ) {
+                                fullChatContentReady = true
+                                publishState()
+                            }
+                        }
+                    }
+                }
+            }
         }
         if (presentation.presentation == OverlayPresentation.EDGE_HANDLE && !hasWork()) {
             completionHold = false
@@ -465,6 +492,7 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
         val summary = summaryText(selectedConversation)
         stateStore.publish(OverlayViewState(
             presentation = presentation.presentation,
+            fullChatContentReady = fullChatContentReady,
             theme = theme,
             selectedConversationId = selected,
             conversations = conversations,
@@ -944,6 +972,8 @@ class DeviceOperationOverlayService : LifecycleService(), SavedStateRegistryOwne
     }
 
     private fun removeOverlay() {
+        presentationRevision++
+        fullChatContentReady = true
         inputFocusActive = false
         windowController.detach()?.let { overlayY = it }
         fullDragSession = null

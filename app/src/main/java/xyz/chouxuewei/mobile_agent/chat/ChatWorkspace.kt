@@ -65,16 +65,20 @@ class ChatWorkspace(private val app: PrototypeApplication) {
         }
     }
     private suspend fun activate(c: Conversation) {
-        current.value?.takeIf { it != c.id }?.let { draftPersistence.flush(it) }
+        val previous = current.value?.takeIf { it != c.id }
         if (drafts.value[c.id] == null) {
             drafts.update {
                 it + (c.id to ComposerDraft(c.draft, c.attachments, c.draftSkills))
             }
         }
+        // Publish the already-loaded conversation before waiting for DataStore/Room/file cleanup.
+        // The persistence work remains ordered, but it no longer delays the visible selection.
         current.value = c.id
         app.appearance.setCurrentConversation(c.id)
+        previous?.let { draftPersistence.flush(it) }
     }
     fun select(id: String) = dispatch { app.conversations.conversation(id)?.let { activate(it) } }
+    fun select(conversation: Conversation) = dispatch { activate(conversation) }
     fun newConversation() = dispatch { activate(createConversationWithDefaults()) }
 
     private suspend fun createConversationWithDefaults(): Conversation {

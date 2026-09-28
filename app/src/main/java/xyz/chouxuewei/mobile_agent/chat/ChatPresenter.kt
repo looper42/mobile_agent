@@ -59,6 +59,7 @@ data class ChatEnvironmentUiState(
 )
 
 data class ConversationTimelineState(
+    val conversationId: String? = null,
     val messages: List<Message> = emptyList(),
     val toolCalls: List<ToolCallRecord> = emptyList(),
     val artifacts: List<Artifact> = emptyList(),
@@ -137,6 +138,7 @@ class ChatPresenter(app: PrototypeApplication, scope: CoroutineScope) {
                 app.artifacts.observeArtifacts(conversationId),
             ) { persisted, streaming, calls, artifacts ->
                 ConversationTimelineState(
+                    conversationId = conversationId,
                     messages = persisted.withStreamingReply(streaming[conversationId]),
                     toolCalls = calls,
                     artifacts = artifacts,

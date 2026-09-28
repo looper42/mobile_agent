@@ -75,6 +75,64 @@ class OverlayEdgeStatusTest {
         compose.onNodeWithTag("overlay_virtual_screen_focused").assertDoesNotExist()
     }
 
+    @Test
+    fun presentationSwitchDisposesPreviousTreeImmediately() {
+        compose.mainClock.autoAdvance = false
+        val state = mutableStateOf(OverlayViewState(presentation = OverlayPresentation.SUMMARY))
+        compose.setContent { OverlayContent(state.value, NoOpOverlayActions) }
+
+        compose.onNodeWithTag("overlay_summary").assertExists()
+        compose.runOnIdle {
+            state.value = state.value.copy(presentation = OverlayPresentation.FULL_CHAT)
+        }
+
+        compose.onNodeWithTag("overlay_summary").assertDoesNotExist()
+        compose.onNodeWithTag("overlay_full_chat").assertExists()
+    }
+
+    @Test
+    fun collapseAndExpandRetainsFullChatCompositionState() {
+        val state = mutableStateOf(
+            OverlayViewState(
+                presentation = OverlayPresentation.FULL_CHAT,
+                mode = ExecutionMode.VIRTUAL_DISPLAY,
+            ),
+        )
+        compose.setContent { OverlayContent(state.value, NoOpOverlayActions) }
+        compose.onNodeWithTag("overlay_virtual_screen_image").performClick()
+        compose.onNodeWithTag("overlay_virtual_screen_focused").assertExists()
+
+        compose.runOnIdle {
+            state.value = state.value.copy(presentation = OverlayPresentation.SUMMARY)
+        }
+        compose.onNodeWithTag("overlay_summary").assertExists()
+        compose.runOnIdle {
+            state.value = state.value.copy(presentation = OverlayPresentation.FULL_CHAT)
+        }
+
+        compose.onNodeWithTag("overlay_virtual_screen_focused").assertExists()
+    }
+
+    @Test
+    fun fullChatShellDefersHeavyContentUntilNextFrameIsReady() {
+        val state = mutableStateOf(
+            OverlayViewState(
+                presentation = OverlayPresentation.FULL_CHAT,
+                fullChatContentReady = false,
+            ),
+        )
+        compose.setContent { OverlayContent(state.value, NoOpOverlayActions) }
+
+        compose.onNodeWithTag("overlay_full_chat_shell").assertExists()
+        compose.onNodeWithTag("overlay_full_chat").assertDoesNotExist()
+        compose.runOnIdle {
+            state.value = state.value.copy(fullChatContentReady = true)
+        }
+
+        compose.onNodeWithTag("overlay_full_chat_shell").assertDoesNotExist()
+        compose.onNodeWithTag("overlay_full_chat").assertExists()
+    }
+
     private fun pixelsDiffer(first: androidx.compose.ui.graphics.PixelMap, second: androidx.compose.ui.graphics.PixelMap): Boolean {
         if (first.width != second.width || first.height != second.height) return true
         for (y in 0 until first.height) {
